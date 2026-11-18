@@ -1,0 +1,26 @@
+[package]
+name = "oniko"
+description = "Desktop chat for coding agents over ACP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "oniko"
+path = "src/main.rs"
+
+[dependencies]
+oniko-core.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+gpui.workspace = true
+serde_json.workspace = true
+pulldown-cmark = { version = "0.13.6", default-features = false }
+rust-embed = "8.13.0"
+unicode-segmentation = "1.12"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-notification-sys = "0.6"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify-rust = "4.18"
