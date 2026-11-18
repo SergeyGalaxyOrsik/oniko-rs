@@ -189,7 +189,7 @@ fn pr_link(id: &str, pr: &PullRequest, label: String, cx: &App) -> AnyElement {
 }
 
 /// Linear's workflow icons: a dashed ring for backlog, an empty ring before work starts, a ring with a
-/// dot as work moves along, a filled check when done and a filled cross when canceled.
+/// dot as work moves along, a filled eye in review, a filled check when done and a filled cross when canceled.
 pub fn status_icon(status: &TaskStatus, cx: &App) -> impl IntoElement {
     let t = theme(cx);
     let color = t.status(status.color);
@@ -208,16 +208,23 @@ pub fn status_icon(status: &TaskStatus, cx: &App) -> impl IntoElement {
             .justify_center()
             .child(div().size(px(6.)).rounded_full().bg(color))
             .into_any_element(),
-        StatusKind::Completed | StatusKind::Canceled => div()
-            .size(size)
-            .flex_none()
-            .rounded_full()
-            .bg(color)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(icon(if status.kind == StatusKind::Completed { Icon::Check } else { Icon::X }, t.background).size(px(10.)))
-            .into_any_element(),
+        StatusKind::Review | StatusKind::Completed | StatusKind::Canceled => {
+            let glyph = match status.kind {
+                StatusKind::Review => Icon::Eye,
+                StatusKind::Completed => Icon::Check,
+                _ => Icon::X,
+            };
+            div()
+                .size(size)
+                .flex_none()
+                .rounded_full()
+                .bg(color)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(glyph, t.background).size(px(10.)))
+                .into_any_element()
+        }
     }
 }
 

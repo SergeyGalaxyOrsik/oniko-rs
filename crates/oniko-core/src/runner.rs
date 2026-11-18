@@ -118,6 +118,17 @@ impl Core {
         }
     }
 
+    /// Moves the task to the project's first status of `kind`; a project without one leaves it where it is.
+    pub(crate) fn move_to_first(&mut self, id: &str, kind: StatusKind) {
+        let Some(task) = self.tasks.get(id) else { return };
+        let target = self.tasks.state().project_statuses(&task.project).into_iter().find(|s| s.kind == kind).map(|s| s.id.clone());
+        if let Some(target) = target
+            && let Ok((true, _)) = self.tasks.move_task(id, &target, None)
+        {
+            self.publish_tasks();
+        }
+    }
+
     pub(crate) fn notify_task(&self, thread_id: &str, title: String, body: String) {
         (self.notify)(TaskNotice { title, body, thread_id: thread_id.to_owned() });
     }
@@ -189,13 +200,7 @@ impl Core {
         let thread_id = self.create_thread(&subscription, worktree.clone(), format!("{}: {}", task.key(), task.title));
         // Recorded before the session exists, which looks the task up for its env.
         self.set_run(id, Some(TaskRun::Working(RunInfo { thread_id: thread_id.clone(), worktree, branch: branch.clone() })));
-        let started = self.tasks.state().project_statuses(&task.project).into_iter().find(|s| s.kind == StatusKind::Started).map(|s| s.id.clone());
-        if let Some(started) = started
-            && let Ok((changed, _)) = self.tasks.move_task(id, &started, None)
-            && changed
-        {
-            self.publish_tasks();
-        }
+        self.move_to_first(id, StatusKind::Started);
         match self.session_with(&thread_id, config) {
             Ok(session) => session.prompt(task_prompt(&task, &branch)),
             Err(error) => self.set_run(id, Some(TaskRun::Failed { error })),
@@ -297,6 +302,7 @@ mod tests {
         backlog: String,
         todo: String,
         in_progress: String,
+        in_review: String,
         done: String,
     }
 
@@ -304,7 +310,7 @@ mod tests {
         let project = project.to_string_lossy().into_owned();
         h.core.tasks.open(&project).unwrap();
         let ids: Vec<String> = h.core.tasks.state().project_statuses(&project).iter().map(|s| s.id.clone()).collect();
-        Board { project, backlog: ids[0].clone(), todo: ids[1].clone(), in_progress: ids[2].clone(), done: ids[3].clone() }
+        Board { project, backlog: ids[0].clone(), todo: ids[1].clone(), in_progress: ids[2].clone(), in_review: ids[3].clone(), done: ids[4].clone() }
     }
 
     fn create(h: &mut Harness, b: &Board, title: &str, description: &str, status: &str) -> String {
@@ -555,6 +561,7 @@ mod tests {
         let (id, thread, worktree) = into_review(&mut h, &b, "Ship it").await;
         let parked = review(&h, &id);
         assert_eq!((parked.worktree.as_deref(), parked.pr.state), (None, PrState::Open));
+        assert_eq!(task(&h, &id).status_id, b.in_review, "an open pull request moves the task to In review");
         assert!(!worktree.exists(), "a clean worktree is removed while the pull request waits");
         assert!(h.calls().contains(&Call::Dispose(worktree.to_string_lossy().into_owned())));
         assert_eq!(git(&repo, &["branch", "--list", &parked.branch]), format!("{}", parked.branch));
@@ -585,6 +592,18 @@ mod tests {
         h.core.check_pull_requests();
         h.settle().await;
         assert_eq!(review(&h, &id).conflict_fix, ConflictFix::Clear);
+    }
+
+    #[tokio::test]
+    async fn stays_in_progress_on_a_board_without_a_review_status() {
+        let mut h = real_git();
+        let repo = h.dir.path().join("app");
+        init_repo(&repo);
+        let b = board(&mut h, &repo);
+        h.core.tasks.remove_status(&b.in_review).unwrap();
+        let (id, _, _) = into_review(&mut h, &b, "Ship it").await;
+        assert_eq!(task(&h, &id).status_id, b.in_progress);
+        assert!(matches!(run(&h, &id), Some(TaskRun::Review(_))));
     }
 
     #[tokio::test]

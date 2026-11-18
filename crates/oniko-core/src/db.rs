@@ -15,7 +15,7 @@ use crate::model::{
 use crate::util::now_ms;
 
 /// Append-only. Each entry runs once, in order, tracked by PRAGMA user_version.
-pub const MIGRATIONS: [&str; 6] = [
+pub const MIGRATIONS: [&str; 7] = [
     "CREATE TABLE IF NOT EXISTS threads (
        id TEXT PRIMARY KEY,
        agent_id TEXT NOT NULL,
@@ -89,6 +89,15 @@ pub const MIGRATIONS: [&str; 6] = [
        blocker_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
        PRIMARY KEY (task_id, blocker_id)
      );",
+    // An "In review" column right after each project's first started status, where a task whose pull
+    // request is open moves. A project without a started status has nowhere to put it.
+    "INSERT INTO task_statuses (id, project, name, color, kind, position)
+     SELECT lower(hex(randomblob(16))), s.project, 'In review', 'green', 'review',
+            COALESCE((s.position + (SELECT MIN(n.position) FROM task_statuses n WHERE n.project = s.project AND n.position > s.position)) / 2.0,
+                     s.position + 1)
+     FROM task_statuses s
+     WHERE s.id = (SELECT f.id FROM task_statuses f WHERE f.project = s.project AND f.kind = 'started' ORDER BY f.position, f.id LIMIT 1)
+       AND NOT EXISTS (SELECT 1 FROM task_statuses r WHERE r.project = s.project AND r.kind = 'review');",
 ];
 
 /// A subscription as stored: the login command is derived from the agent spec on load.
@@ -538,6 +547,48 @@ mod tests {
         assert_eq!((task.title.as_str(), task.pull_request, task.model.as_deref()), ("Old task", true, None));
         assert!(task.blocked_by.is_empty());
         assert_eq!(task.run, Some(TaskRun::Failed { error: "x".into() }));
+    }
+
+    #[test]
+    fn adds_an_in_review_status_after_the_first_started_one_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oniko.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..6] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.execute_batch(
+                "PRAGMA user_version = 6;
+                 INSERT INTO task_statuses (id, project, name, color, kind, position) VALUES
+                   ('a1', '/a', 'To do', 'slate', 'unstarted', 1), ('a2', '/a', 'Doing', 'amber', 'started', 2),
+                   ('a3', '/a', 'QA', 'blue', 'started', 3), ('a4', '/a', 'Done', 'violet', 'completed', 4),
+                   ('b1', '/b', 'Doing', 'amber', 'started', 1),
+                   ('c1', '/c', 'Doing', 'amber', 'started', 1), ('c2', '/c', 'Reviewing', 'blue', 'review', 2),
+                   ('d1', '/d', 'Done', 'violet', 'completed', 1);",
+            )
+            .unwrap();
+        }
+        let board = |db: &Db, project: &str| -> Vec<(String, StatusKind)> {
+            db.load_task_statuses().unwrap().into_iter().filter(|s| s.project == project).map(|s| (s.name, s.kind)).collect()
+        };
+        let named = |names: &[(&str, StatusKind)]| -> Vec<(String, StatusKind)> { names.iter().map(|(n, k)| ((*n).to_owned(), *k)).collect() };
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            assert_eq!(
+                board(&db, "/a"),
+                named(&[
+                    ("To do", StatusKind::Unstarted),
+                    ("Doing", StatusKind::Started),
+                    ("In review", StatusKind::Review),
+                    ("QA", StatusKind::Started),
+                    ("Done", StatusKind::Completed)
+                ])
+            );
+            assert_eq!(board(&db, "/b"), named(&[("Doing", StatusKind::Started), ("In review", StatusKind::Review)]));
+            assert_eq!(board(&db, "/c"), named(&[("Doing", StatusKind::Started), ("Reviewing", StatusKind::Review)]));
+            assert_eq!(board(&db, "/d"), named(&[("Done", StatusKind::Completed)]));
+        }
     }
 
     #[test]

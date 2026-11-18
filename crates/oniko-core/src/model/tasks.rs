@@ -58,19 +58,22 @@ pub enum StatusKind {
     Backlog,
     Unstarted,
     Started,
+    /// A pull request waits for review; not done, so the tasks after it keep waiting.
+    Review,
     Completed,
     Canceled,
 }
 
 impl StatusKind {
-    pub const ALL: [StatusKind; 5] =
-        [StatusKind::Backlog, StatusKind::Unstarted, StatusKind::Started, StatusKind::Completed, StatusKind::Canceled];
+    pub const ALL: [StatusKind; 6] =
+        [StatusKind::Backlog, StatusKind::Unstarted, StatusKind::Started, StatusKind::Review, StatusKind::Completed, StatusKind::Canceled];
 
     pub fn as_str(self) -> &'static str {
         match self {
             StatusKind::Backlog => "backlog",
             StatusKind::Unstarted => "unstarted",
             StatusKind::Started => "started",
+            StatusKind::Review => "review",
             StatusKind::Completed => "completed",
             StatusKind::Canceled => "canceled",
         }
@@ -85,6 +88,7 @@ impl StatusKind {
             StatusKind::Backlog => "Backlog",
             StatusKind::Unstarted => "Not started",
             StatusKind::Started => "In progress",
+            StatusKind::Review => "In review",
             StatusKind::Completed => "Completed",
             StatusKind::Canceled => "Canceled",
         }
@@ -296,10 +300,11 @@ pub struct TasksState {
 }
 
 /// Every project starts with these; the user can rename, remove or add to them.
-pub const DEFAULT_STATUSES: [(&str, StatusColor, StatusKind); 4] = [
+pub const DEFAULT_STATUSES: [(&str, StatusColor, StatusKind); 5] = [
     ("Backlog", StatusColor::Slate, StatusKind::Backlog),
     ("To do", StatusColor::Slate, StatusKind::Unstarted),
     ("In progress", StatusColor::Amber, StatusKind::Started),
+    ("In review", StatusColor::Green, StatusKind::Review),
     ("Done", StatusColor::Violet, StatusKind::Completed),
 ];
 

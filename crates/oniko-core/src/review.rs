@@ -97,6 +97,7 @@ impl Core {
         };
         let review = Review { thread_id: info.thread_id, branch: info.branch, worktree: Some(info.worktree), pr, conflict_fix: ConflictFix::Clear };
         self.set_run(id, Some(TaskRun::Review(review.clone())));
+        self.move_to_first(id, StatusKind::Review);
         self.notify_task(&review.thread_id, format!("{key}: pull request opened"), review.pr.url.clone());
         self.park(&task.project, id, &review);
         self.ensure_polling();
@@ -241,12 +242,7 @@ impl Core {
     fn merged(&mut self, task: &Task, review: Review) {
         let merged = Merged { thread_id: review.thread_id, branch: review.branch, pr: review.pr };
         self.set_run(&task.id, Some(TaskRun::Merged(merged.clone())));
-        let done = self.tasks.state().project_statuses(&task.project).into_iter().find(|s| s.kind == StatusKind::Completed).map(|s| s.id.clone());
-        if let Some(done) = done
-            && let Ok((true, _)) = self.tasks.move_task(&task.id, &done, None)
-        {
-            self.publish_tasks();
-        }
+        self.move_to_first(&task.id, StatusKind::Completed);
         self.notify_task(&merged.thread_id, format!("{}: pull request merged", task.key()), task.title.clone());
         self.clean_merged(&task.project, &merged);
     }
