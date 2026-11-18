@@ -191,16 +191,18 @@ impl TaskPage {
                 .child(div().text_color(t.muted_foreground).child(format!("Move the task to {queue} again to retry.")))
                 .into_any_element(),
             Some(run) => {
-                let Some(info) = run.info().cloned() else { return div().into_any_element() };
-                let status = store(cx).read(cx).state.threads.get(&info.thread_id).map(|th| th.status.clone());
+                let (Some(thread_id), Some(branch)) = (run.thread_id().cloned(), run.branch().map(str::to_owned)) else { return div().into_any_element() };
+                let worktree = run.worktree().map(str::to_owned);
+                let status = store(cx).read(cx).state.threads.get(&thread_id).map(|th| th.status.clone());
                 let stage = match (&status, run) {
                     (Some(ThreadStatus::AwaitingPermission { .. }), _) => "Needs your approval",
                     (Some(ThreadStatus::Running { .. }), TaskRun::Finished(_)) => "Working on it",
                     (_, TaskRun::Working(_)) => "Working on it",
                     (_, TaskRun::PullRequest(_)) => "Opening a pull request",
+                    (_, TaskRun::Review(_)) => "In review",
+                    (_, TaskRun::Merged(_)) => "Merged",
                     _ => "Finished",
                 };
-                let thread_id = info.thread_id.clone();
                 div()
                     .flex()
                     .flex_col()
@@ -220,9 +222,9 @@ impl TaskPage {
                             .text_xs()
                             .text_color(t.muted_foreground)
                             .child(icon(Icon::GitBranch, t.muted_foreground).size(px(12.)))
-                            .child(div().truncate().child(info.branch.clone())),
+                            .child(div().truncate().child(branch)),
                     )
-                    .child(
+                    .children(worktree.map(|worktree| {
                         div()
                             .flex()
                             .items_center()
@@ -231,8 +233,8 @@ impl TaskPage {
                             .text_xs()
                             .text_color(t.muted_foreground)
                             .child(icon(Icon::FolderGit, t.muted_foreground).size(px(12.)))
-                            .child(div().truncate().child(shorten_home(&info.worktree, &home))),
-                    )
+                            .child(div().truncate().child(shorten_home(&worktree, &home)))
+                    }))
                     .into_any_element()
             }
         }
@@ -280,7 +282,7 @@ impl Render for TaskPage {
                 cx,
             )
         });
-        let pull_request_locked = matches!(task.run, Some(TaskRun::PullRequest(_) | TaskRun::Finished(_)));
+        let pull_request_locked = matches!(task.run, Some(TaskRun::PullRequest(_) | TaskRun::Finished(_) | TaskRun::Review(_) | TaskRun::Merged(_)));
         let toggle_id = task_id.clone();
         let pull_request = task.pull_request;
         let delete_id = task_id.clone();

@@ -1,5 +1,5 @@
-//! The SQLite file the Electron app wrote, read and written the same way: identical migrations and
-//! JSON columns, so either app can open a database the other created.
+//! The SQLite file the Electron app wrote, read and written the same way: the same migrations and
+//! JSON columns up to the task plan, which only this app adds.
 
 use std::path::Path;
 
@@ -15,7 +15,7 @@ use crate::model::{
 use crate::util::now_ms;
 
 /// Append-only. Each entry runs once, in order, tracked by PRAGMA user_version.
-pub const MIGRATIONS: [&str; 5] = [
+pub const MIGRATIONS: [&str; 6] = [
     "CREATE TABLE IF NOT EXISTS threads (
        id TEXT PRIMARY KEY,
        agent_id TEXT NOT NULL,
@@ -82,6 +82,13 @@ pub const MIGRATIONS: [&str; 5] = [
     "ALTER TABLE tasks ADD COLUMN subscription_id TEXT;
      ALTER TABLE tasks ADD COLUMN pull_request INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE tasks ADD COLUMN run_json TEXT;",
+    // From here on the schema is the Rust app's alone; the Electron app's migrations end above.
+    "ALTER TABLE tasks ADD COLUMN model TEXT;
+     CREATE TABLE IF NOT EXISTS task_dependencies (
+       task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+       blocker_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+       PRIMARY KEY (task_id, blocker_id)
+     );",
 ];
 
 /// A subscription as stored: the login command is derived from the agent spec on load.
@@ -322,13 +329,21 @@ impl Db {
     }
 
     pub fn load_tasks(&self) -> Result<Vec<Task>> {
+        let mut blockers: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut stmt = self.conn.prepare("SELECT task_id, blocker_id FROM task_dependencies ORDER BY rowid")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            blockers.entry(row.get(0)?).or_default().push(row.get(1)?);
+        }
         let mut stmt = self.conn.prepare("SELECT * FROM tasks ORDER BY project, position")?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let run: Option<String> = row.get("run_json")?;
+            let id: String = row.get("id")?;
             out.push(Task {
-                id: row.get("id")?,
+                blocked_by: blockers.remove(&id).unwrap_or_default(),
+                id,
                 project: row.get("project")?,
                 number: row.get("number")?,
                 title: row.get("title")?,
@@ -339,6 +354,7 @@ impl Db {
                 updated_at: row.get("updated_at")?,
                 subscription_id: row.get("subscription_id")?,
                 pull_request: row.get::<_, i64>("pull_request")? == 1,
+                model: row.get("model")?,
                 run: run.map(|text| parse::<TaskRun>(&text, "task run")).transpose()?,
             });
         }
@@ -347,11 +363,11 @@ impl Db {
 
     pub fn save_task(&self, task: &Task) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tasks (id, project, number, title, description, status_id, position, created_at, updated_at, subscription_id, pull_request, run_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO tasks (id, project, number, title, description, status_id, position, created_at, updated_at, subscription_id, pull_request, model, run_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET title = excluded.title, description = excluded.description, status_id = excluded.status_id,
                position = excluded.position, updated_at = excluded.updated_at, subscription_id = excluded.subscription_id,
-               pull_request = excluded.pull_request, run_json = excluded.run_json",
+               pull_request = excluded.pull_request, model = excluded.model, run_json = excluded.run_json",
             params![
                 task.id,
                 task.project,
@@ -364,14 +380,26 @@ impl Db {
                 task.updated_at,
                 task.subscription_id,
                 task.pull_request as i64,
+                task.model,
                 task.run.as_ref().map(json),
             ],
         )?;
         Ok(())
     }
 
+    /// Its dependency rows in both directions go with it.
     pub fn delete_task(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn add_dependency(&self, task_id: &str, blocker_id: &str) -> Result<()> {
+        self.conn.execute("INSERT OR IGNORE INTO task_dependencies (task_id, blocker_id) VALUES (?1, ?2)", [task_id, blocker_id])?;
+        Ok(())
+    }
+
+    pub fn remove_dependency(&self, task_id: &str, blocker_id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM task_dependencies WHERE task_id = ?1 AND blocker_id = ?2", [task_id, blocker_id])?;
         Ok(())
     }
 
@@ -483,6 +511,33 @@ mod tests {
         let restored = db.load_threads().unwrap().remove(0).restored();
         assert_eq!(restored.status, ThreadStatus::Dormant);
         assert!(matches!(&restored.timeline[0], TimelineItem::Notice { text, .. } if text == INTERRUPTED_NOTICE));
+    }
+
+    #[test]
+    fn migrating_from_the_previous_version_keeps_existing_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oniko.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.execute_batch(&format!("PRAGMA user_version = {}", MIGRATIONS.len() - 1)).unwrap();
+            conn.execute_batch(
+                "INSERT INTO task_statuses (id, project, name, color, kind, position) VALUES ('s', '/p', 'To do', 'slate', 'unstarted', 1);
+                 INSERT INTO tasks (id, project, title, description, status_id, position, created_at, updated_at, number, pull_request, run_json)
+                 VALUES ('t', '/p', 'Old task', '', 's', 1, 1, 1, 1, 1, '{\"stage\":\"failed\",\"error\":\"x\"}');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.user_version().unwrap(), MIGRATIONS.len() as i64);
+        let tasks = db.load_tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert_eq!((task.title.as_str(), task.pull_request, task.model.as_deref()), ("Old task", true, None));
+        assert!(task.blocked_by.is_empty());
+        assert_eq!(task.run, Some(TaskRun::Failed { error: "x".into() }));
     }
 
     #[test]

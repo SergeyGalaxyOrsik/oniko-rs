@@ -76,7 +76,7 @@ fn spawn(cwd: &str, session: Option<String>, tx: mpsc::UnboundedSender<ThreadEve
     SessionHandle::spawn(SessionOptions {
         agent_id: AgentId::Claude,
         cwd: cwd.into(),
-        account_env: env,
+        env,
         acp_session_id: session,
         initial_config: vec![],
         log_path: std::env::temp_dir().join("oniko-session-smoke.log"),

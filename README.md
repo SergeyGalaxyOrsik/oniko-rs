@@ -1,6 +1,6 @@
 # Oniko (Rust)
 
-Desktop chat for coding agents over ACP, rewritten from Electron + React to Rust on [gpui](https://crates.io/crates/gpui). The web app (`../oniko-web`) is unchanged; this app still talks to its telemetry API.
+Desktop chat for coding agents over ACP, rewritten from Electron + React to Rust on [gpui](https://crates.io/crates/gpui). It sends anonymous telemetry to the same API as the Electron app; `ONIKO_TELEMETRY=0` turns it off.
 
 ## Run
 
@@ -10,7 +10,18 @@ cargo run -p oniko                 # debug build
 cargo test --workspace             # core and UI unit tests
 ```
 
-The app opens the same `oniko.db` the Electron app used (`~/Library/Application Support/oniko` on macOS). The schema, migrations and JSON columns are identical, so either app can read what the other wrote.
+The app opens the same `oniko.db` the Electron app used (`~/Library/Application Support/oniko` on macOS). Up to migration 5 the schemas are identical. Migration 6 adds task models and dependencies, which the Electron app does not know.
+
+## Tasks
+
+Each project has a board of tasks. A task waits in a "Not started" status until every task it depends on is completed, then it starts at once. There is no limit on how many run in parallel.
+
+- Each started task gets its own git worktree and branch, created from a fresh `origin/HEAD`. Oniko never checks out or pulls in the project folder itself, and runs its own git commands for one project one at a time.
+- A task can pin the model its agent runs on. If the agent does not offer that model, the start fails instead of falling back.
+- With a pull request, the agent rebases on the base branch, pushes and runs `gh pr create`. Oniko then reads the pull request's state from GitHub with `gh pr list`, once a minute, while any is open.
+- While a pull request waits, its clean worktree is removed and the branch kept. On a conflict, Oniko restores the worktree and asks the agent to fix it once, then tells you.
+- On merge, the task moves to Done, its worktree and local branch are deleted, and the tasks waiting on it start from the new base.
+- Every task agent gets `CARGO_TARGET_DIR=<project>/target`, so all worktrees of a Rust project share one build folder instead of each growing its own. Parallel builds wait for Cargo's lock on it.
 
 ## The agent
 
