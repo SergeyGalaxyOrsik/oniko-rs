@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use super::agents::AutoModes;
 use super::config::{controls_from_config_options, with_value};
 use super::events::{AppEvent, ThreadEvent, ThreadEventBody};
 use super::subscriptions::SubscriptionsState;
@@ -245,6 +246,7 @@ pub struct AppState {
     pub threads: ThreadMap,
     pub subscriptions: SubscriptionsState,
     pub tasks: TasksState,
+    pub auto_modes: AutoModes,
 }
 
 impl AppState {
@@ -252,6 +254,7 @@ impl AppState {
         match event {
             AppEvent::Subscriptions(state) => self.subscriptions = state.clone(),
             AppEvent::Tasks(state) => self.tasks = state.clone(),
+            AppEvent::AutoModes(state) => self.auto_modes = state.clone(),
             AppEvent::Thread(event) => {
                 reduce_threads(&mut self.threads, event);
             }

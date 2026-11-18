@@ -2,7 +2,7 @@
 //! and results of background work (agent events, git, login probes) arrive as jobs and run one at a
 //! time, so no state is ever shared or locked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::db::Db;
 use crate::model::reducer::{Outcome, ThreadMap, reduce_threads};
 use crate::model::{
-    AgentId, AppEvent, AppSnapshot, SequencedEvent, StatusKind, Subscription, SubscriptionId, TaskId, TaskStatusId, Thread,
+    AgentId, AppEvent, AppSnapshot, AutoModes, SequencedEvent, StatusKind, Subscription, SubscriptionId, TaskId, TaskStatusId, Thread,
     ThreadEvent, ThreadEventBody, ThreadId, ThreadStatus,
 };
 use crate::registry::{AccountSpecs, account_specs, base_env};
@@ -168,7 +168,11 @@ impl CoreHandle {
     }
 
     pub fn set_config(&self, id: ThreadId, config_id: String, value: String) -> impl Future<Output = Result<(), String>> + use<> {
-        self.command("threads:setConfig", move |core| core.session(&id).map(|s| s.set_config(config_id, value)))
+        self.command("threads:setConfig", move |core| {
+            // A mode the user picks is no verdict on the model.
+            core.auto_mode_watch.remove(&id);
+            core.session(&id).map(|s| s.set_config(config_id, value))
+        })
     }
 
     /// `None` declines.
@@ -366,6 +370,10 @@ fn err(error: anyhow::Error) -> String {
 }
 
 const RECENT_KEY: &str = "recentFolders";
+
+pub(crate) fn auto_mode_key(agent: AgentId) -> String {
+    format!("autoMode.{}", agent.as_str())
+}
 const RECENT_LIMIT: usize = 8;
 
 pub struct CoreDeps {
@@ -403,6 +411,9 @@ pub struct Core {
     pub(crate) notify: Notify,
     session_factory: SessionFactory,
     pub(crate) telemetry: Telemetry,
+    pub(crate) auto_modes: AutoModes,
+    /// Task threads asked to run in auto mode whose config has not yet told whether the model has it.
+    pub(crate) auto_mode_watch: HashSet<ThreadId>,
 }
 
 impl Core {
@@ -415,6 +426,10 @@ impl Core {
             threads.insert(restored.id.clone(), restored);
         }
         let tasks = TaskStore::new(deps.db.clone())?;
+        let mut auto_modes = AutoModes::default();
+        for agent in AgentId::ALL {
+            auto_modes.set(agent, deps.db.get_setting(&auto_mode_key(agent)).unwrap_or_default());
+        }
         let mut core = Core {
             db: deps.db,
             seq: 0,
@@ -433,6 +448,8 @@ impl Core {
             notify: deps.notify,
             session_factory: deps.sessions,
             telemetry: deps.telemetry,
+            auto_modes,
+            auto_mode_watch: HashSet::new(),
         };
         core.fail_interrupted_starts();
         core.resume_reviews();
@@ -447,6 +464,7 @@ impl Core {
             threads: self.thread_list().into_iter().cloned().collect(),
             subscriptions: self.subscriptions.state(),
             tasks: self.tasks.state().clone(),
+            auto_modes: self.auto_modes.clone(),
         }
     }
 
@@ -501,6 +519,7 @@ impl Core {
 
     /// Every thread change goes through here: reduced, written through to the db, then broadcast.
     pub(crate) fn dispatch(&mut self, event: ThreadEvent) {
+        let mode_before = self.auto_mode_watch.contains(&event.thread_id).then(|| self.mode_of(&event.thread_id));
         let outcome = reduce_threads(&mut self.threads, &event);
         let saved = match &outcome {
             Outcome::Unchanged => Ok(()),
@@ -516,6 +535,9 @@ impl Core {
         }
         self.publish(AppEvent::Thread(event.clone()));
         self.on_task_thread_event(&event);
+        if let Some(mode_before) = mode_before {
+            self.watch_auto_mode(&event, mode_before);
+        }
     }
 
     pub(crate) fn count_using(&self, subscription_id: &str) -> usize {

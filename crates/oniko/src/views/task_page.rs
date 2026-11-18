@@ -5,7 +5,7 @@ use std::time::Duration;
 use gpui::{AnyElement, App, AsyncApp, Context, Corner, Entity, EventEmitter, FontWeight, IntoElement, SharedString, Task as GpuiTask, WeakEntity, Window, div, prelude::*, px};
 use oniko_core::model::config::new_thread_config;
 use oniko_core::model::reducer::AppState;
-use oniko_core::model::{ConfigChoice, StatusKind, Task, TaskId, TaskRun, TaskStatus, ThreadStatus};
+use oniko_core::model::{ConfigChoice, StatusKind, Subscription, Task, TaskId, TaskRun, TaskStatus, ThreadStatus};
 use oniko_core::stores::tasks::TaskPatch;
 
 use crate::icons::{Icon, icon};
@@ -194,6 +194,8 @@ impl TaskPage {
         }
         let current = task.model.clone();
         let task_id = task.id.clone();
+        let agent = task_subscription(task, state).map(|s| s.agent_id);
+        let auto_modes = state.auto_modes.clone();
         dropdown(
             "task-model",
             crate::ui::is_open(&self.open_menu, "model"),
@@ -210,7 +212,9 @@ impl TaskPage {
                         rows.push(MenuEntry::Separator);
                         rows.extend(choices.into_iter().map(|o| {
                             let checked = current.as_ref() == Some(&o.value);
-                            item(o.label, set(Some(o.value))).checked(checked).entry()
+                            let row = item(o.label, set(Some(o.value.clone()))).checked(checked);
+                            let no_auto = agent.is_some_and(|agent| auto_modes.get(agent, &o.value) == Some(false));
+                            if no_auto { row.detail("Asks before commands") } else { row }.entry()
                         }));
                     }
                     None => rows.push(item("Models appear after the agent has run once", |_, _| {}).disabled(true).entry()),
@@ -412,13 +416,17 @@ impl TaskPage {
 
 /// The models the task's agent offered on its newest thread; None until that agent has run once.
 pub fn model_choices(task: &Task, state: &AppState) -> Option<Vec<ConfigChoice>> {
-    let subscription = task
-        .thread_id()
+    let subscription = task_subscription(task, state)?;
+    new_thread_config(state.threads.values(), subscription.agent_id, &subscription.id).into_iter().find(|c| c.id == "model").map(|c| c.options)
+}
+
+/// The subscription the task's agent runs on, or would start on.
+fn task_subscription<'a>(task: &Task, state: &'a AppState) -> Option<&'a Subscription> {
+    task.thread_id()
         .and_then(|id| state.threads.get(id))
         .and_then(|th| state.subscriptions.get(&th.subscription_id))
         .or_else(|| task.subscription_id.as_deref().and_then(|id| state.subscriptions.get(id)))
-        .or_else(|| state.subscriptions.active())?;
-    new_thread_config(state.threads.values(), subscription.agent_id, &subscription.id).into_iter().find(|c| c.id == "model").map(|c| c.options)
+        .or_else(|| state.subscriptions.active())
 }
 
 pub fn model_name(value: &str, choices: Option<&[ConfigChoice]>) -> String {

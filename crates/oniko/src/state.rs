@@ -45,6 +45,7 @@ impl Store {
                             threads: snapshot.threads.into_iter().map(|t| (t.id.clone(), t)).collect(),
                             subscriptions: snapshot.subscriptions,
                             tasks: snapshot.tasks,
+                            auto_modes: snapshot.auto_modes,
                         };
                         store.home = snapshot.home;
                         store.seq = snapshot.seq;
