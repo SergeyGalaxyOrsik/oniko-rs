@@ -12,7 +12,7 @@ use crate::model::{
 };
 use crate::runner::{argv, conflict_prompt, fetch_base, worktree_for, worktree_path};
 
-const POLL_EVERY: Duration = Duration::from_secs(60);
+const POLL_EVERY: Duration = Duration::from_secs(30);
 const PR_FIELDS: &str = "number,url,state,headRefName,mergeable";
 
 #[derive(Deserialize)]
