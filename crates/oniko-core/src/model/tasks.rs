@@ -109,23 +109,142 @@ pub struct RunInfo {
     pub branch: String,
 }
 
-/// The agent working a task, from the moment the task enters a "Not started" status. A failed run
-/// is retried by moving the task into one again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mergeable {
+    Mergeable,
+    Conflicting,
+    Unknown,
+}
+
+/// GitHub's view of a task's pull request, as of the last check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequest {
+    pub number: i64,
+    pub url: String,
+    pub state: PrState,
+    pub mergeable: Mergeable,
+}
+
+/// How far Oniko went about a conflict with the base branch: one attempt by the agent, then the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictFix {
+    #[default]
+    Clear,
+    /// The agent is resolving it in the worktree right now.
+    Fixing,
+    /// The agent's turn on it ended; the next check tells whether it worked.
+    Attempted,
+    /// It still conflicted after the attempt and the user was told.
+    Escalated,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Review {
+    pub thread_id: ThreadId,
+    pub branch: String,
+    /// None while parked: the folder is removed, the branch stays.
+    pub worktree: Option<String>,
+    pub pr: PullRequest,
+    pub conflict_fix: ConflictFix,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Merged {
+    pub thread_id: ThreadId,
+    pub branch: String,
+    pub pr: PullRequest,
+}
+
+/// What a check of the pull request asks Oniko to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewAction {
+    Merged,
+    Closed,
+    FixConflict,
+    ConflictPersists,
+}
+
+impl Review {
+    /// The review once GitHub reports `pr`. Only transitions yield an action, so repeated checks act once.
+    pub fn observe(&self, pr: PullRequest) -> (Review, Option<ReviewAction>) {
+        let mut next = Review { pr: pr.clone(), ..self.clone() };
+        let action = match (pr.state, pr.mergeable, self.conflict_fix) {
+            (PrState::Merged, ..) => Some(ReviewAction::Merged),
+            (PrState::Closed, ..) => (self.pr.state != PrState::Closed).then_some(ReviewAction::Closed),
+            (PrState::Open, _, ConflictFix::Fixing) => None,
+            (PrState::Open, Mergeable::Conflicting, ConflictFix::Clear) => {
+                next.conflict_fix = ConflictFix::Fixing;
+                Some(ReviewAction::FixConflict)
+            }
+            (PrState::Open, Mergeable::Conflicting, ConflictFix::Attempted) => {
+                next.conflict_fix = ConflictFix::Escalated;
+                Some(ReviewAction::ConflictPersists)
+            }
+            (PrState::Open, Mergeable::Mergeable, _) => {
+                next.conflict_fix = ConflictFix::Clear;
+                None
+            }
+            (PrState::Open, ..) => None,
+        };
+        (next, action)
+    }
+}
+
+/// The agent working a task, from the moment the scheduler starts it. A failed run is retried by
+/// moving the task into a "Not started" status again.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum TaskRun {
     Starting,
     Failed { error: String },
     Working(RunInfo),
+    /// The agent was asked to rebase on the base branch, push and open the pull request.
     PullRequest(RunInfo),
+    /// Done without a pull request.
     Finished(RunInfo),
+    Review(Review),
+    /// Has no worktree: a merged task's folder is removed.
+    Merged(Merged),
 }
 
 impl TaskRun {
-    pub fn info(&self) -> Option<&RunInfo> {
+    pub fn thread_id(&self) -> Option<&ThreadId> {
         match self {
-            TaskRun::Working(info) | TaskRun::PullRequest(info) | TaskRun::Finished(info) => Some(info),
+            TaskRun::Working(info) | TaskRun::PullRequest(info) | TaskRun::Finished(info) => Some(&info.thread_id),
+            TaskRun::Review(review) => Some(&review.thread_id),
+            TaskRun::Merged(merged) => Some(&merged.thread_id),
             TaskRun::Starting | TaskRun::Failed { .. } => None,
+        }
+    }
+
+    pub fn branch(&self) -> Option<&str> {
+        match self {
+            TaskRun::Working(info) | TaskRun::PullRequest(info) | TaskRun::Finished(info) => Some(&info.branch),
+            TaskRun::Review(review) => Some(&review.branch),
+            TaskRun::Merged(merged) => Some(&merged.branch),
+            TaskRun::Starting | TaskRun::Failed { .. } => None,
+        }
+    }
+
+    /// The folder the agent works in, when it is on disk.
+    pub fn worktree(&self) -> Option<&str> {
+        match self {
+            TaskRun::Working(info) | TaskRun::PullRequest(info) | TaskRun::Finished(info) => Some(&info.worktree),
+            TaskRun::Review(review) => review.worktree.as_deref(),
+            TaskRun::Starting | TaskRun::Failed { .. } | TaskRun::Merged(_) => None,
         }
     }
 }
@@ -147,12 +266,16 @@ pub struct Task {
     pub subscription_id: Option<SubscriptionId>,
     /// After the agent's first turn, ask it to push the branch and open a pull request.
     pub pull_request: bool,
+    /// The model the agent runs on; None keeps the last thread's. Fixed once a thread exists.
+    pub model: Option<String>,
+    /// Tasks that must be completed before this one may start: same project, no cycles.
+    pub blocked_by: Vec<TaskId>,
     pub run: Option<TaskRun>,
 }
 
 impl Task {
     pub fn thread_id(&self) -> Option<&ThreadId> {
-        self.run.as_ref()?.info().map(|info| &info.thread_id)
+        self.run.as_ref()?.thread_id()
     }
 
     pub fn key(&self) -> String {
@@ -231,6 +354,74 @@ impl TasksState {
     pub fn thread_project<'a>(&'a self, thread: &'a Thread) -> &'a str {
         self.task_for_thread(&thread.id).map_or(thread.cwd.as_str(), |t| t.project.as_str())
     }
+
+    fn kind(&self, task: &Task) -> Option<StatusKind> {
+        self.status(&task.status_id).map(|s| s.kind)
+    }
+
+    /// Done for the plan: merged, or moved to a completed status by hand.
+    fn completed(&self, task: &Task) -> bool {
+        self.kind(task) == Some(StatusKind::Completed)
+    }
+
+    /// The scheduling rule: queued in a "Not started" status, never run, and every blocker completed.
+    pub fn ready_to_start(&self) -> Vec<TaskId> {
+        self.tasks
+            .iter()
+            .filter(|t| t.run.is_none() && self.kind(t) == Some(StatusKind::Unstarted))
+            .filter(|t| t.blocked_by.iter().all(|id| self.task(id).is_some_and(|b| self.completed(b))))
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    /// Why a task that has not started is held back; a blocker that needs the user is named first.
+    pub fn waiting_reason(&self, task: &Task) -> Option<String> {
+        if task.run.is_some() {
+            return None;
+        }
+        let pending: Vec<&Task> = task.blocked_by.iter().filter_map(|id| self.task(id)).filter(|b| !self.completed(b)).collect();
+        if pending.is_empty() {
+            return None;
+        }
+        let stuck: Vec<String> = pending
+            .iter()
+            .filter_map(|b| match &b.run {
+                _ if self.kind(b) == Some(StatusKind::Canceled) => Some(format!("{} was canceled", b.key())),
+                Some(TaskRun::Review(review)) if review.pr.state == PrState::Closed => {
+                    Some(format!("{}: pull request closed without merging", b.key()))
+                }
+                Some(TaskRun::Failed { .. }) => Some(format!("{} failed", b.key())),
+                _ => None,
+            })
+            .collect();
+        if !stuck.is_empty() {
+            return Some(stuck.join("; "));
+        }
+        Some(format!("Waiting for {}", pending.iter().map(|b| b.key()).collect::<Vec<_>>().join(", ")))
+    }
+
+    /// Whether `task` waits on `other`, directly or through other tasks.
+    pub fn depends_on(&self, task: &str, other: &str) -> bool {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut stack: Vec<&str> = vec![task];
+        while let Some(id) = stack.pop() {
+            for blocker in self.task(id).map(|t| t.blocked_by.as_slice()).unwrap_or_default() {
+                if blocker == other {
+                    return true;
+                }
+                if !seen.contains(&blocker.as_str()) {
+                    seen.push(blocker);
+                    stack.push(blocker);
+                }
+            }
+        }
+        false
+    }
+
+    /// Tasks that wait directly on `id`.
+    pub fn dependents(&self, id: &str) -> Vec<&Task> {
+        self.tasks.iter().filter(|t| t.blocked_by.iter().any(|b| b == id)).collect()
+    }
 }
 
 /// `ONI` for a folder named `oniko`: the first three letters or digits of the folder name.
@@ -302,5 +493,132 @@ mod tests {
         let parsed: TaskRun = serde_json::from_str(r#"{"stage":"pull_request","threadId":"t","worktree":"/w","branch":"b"}"#).unwrap();
         assert!(matches!(parsed, TaskRun::PullRequest(_)));
         assert_eq!(serde_json::to_string(&TaskRun::Starting).unwrap(), r#"{"stage":"starting"}"#);
+    }
+
+    fn pr(state: PrState, mergeable: Mergeable) -> PullRequest {
+        PullRequest { number: 7, url: "https://github.com/o/r/pull/7".into(), state, mergeable }
+    }
+
+    fn review(conflict_fix: ConflictFix) -> Review {
+        Review { thread_id: "t".into(), branch: "b".into(), worktree: None, pr: pr(PrState::Open, Mergeable::Mergeable), conflict_fix }
+    }
+
+    #[test]
+    fn review_json_round_trips_under_its_stage() {
+        let run = TaskRun::Review(review(ConflictFix::Clear));
+        let text = serde_json::to_string(&run).unwrap();
+        assert!(text.starts_with(r#"{"stage":"review","threadId":"t","branch":"b","worktree":null,"pr":{"number":7"#), "{text}");
+        assert_eq!(serde_json::from_str::<TaskRun>(&text).unwrap(), run);
+    }
+
+    #[test]
+    fn a_conflict_is_handed_to_the_agent_once_then_to_the_user_once() {
+        let conflicting = || pr(PrState::Open, Mergeable::Conflicting);
+        let (fixing, action) = review(ConflictFix::Clear).observe(conflicting());
+        assert_eq!((fixing.conflict_fix, action), (ConflictFix::Fixing, Some(ReviewAction::FixConflict)));
+        assert_eq!(fixing.observe(conflicting()), (fixing.clone(), None));
+        let attempted = Review { conflict_fix: ConflictFix::Attempted, ..fixing };
+        let (escalated, action) = attempted.observe(conflicting());
+        assert_eq!((escalated.conflict_fix, action), (ConflictFix::Escalated, Some(ReviewAction::ConflictPersists)));
+        assert_eq!(escalated.observe(conflicting()).1, None);
+        let (clear, action) = escalated.observe(pr(PrState::Open, Mergeable::Mergeable));
+        assert_eq!((clear.conflict_fix, action), (ConflictFix::Clear, None));
+    }
+
+    #[test]
+    fn closing_and_merging_are_reported_on_the_transition() {
+        let (closed, action) = review(ConflictFix::Clear).observe(pr(PrState::Closed, Mergeable::Unknown));
+        assert_eq!(action, Some(ReviewAction::Closed));
+        assert_eq!(closed.observe(pr(PrState::Closed, Mergeable::Unknown)).1, None);
+        assert_eq!(closed.observe(pr(PrState::Merged, Mergeable::Unknown)).1, Some(ReviewAction::Merged));
+    }
+
+    struct Plan {
+        state: TasksState,
+    }
+
+    impl Plan {
+        fn new() -> Plan {
+            let statuses = [("b", StatusKind::Backlog), ("u", StatusKind::Unstarted), ("s", StatusKind::Started), ("c", StatusKind::Completed), ("x", StatusKind::Canceled)]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (id, kind))| TaskStatus { id: id.into(), project: "/p/oniko".into(), name: id.into(), color: StatusColor::Slate, kind, position: i as f64 })
+                .collect();
+            Plan { state: TasksState { statuses, tasks: vec![] } }
+        }
+
+        fn task(mut self, number: i64, status: &str, blocked_by: &[i64]) -> Plan {
+            self.state.tasks.push(Task {
+                id: number.to_string(),
+                project: "/p/oniko".into(),
+                number,
+                title: format!("task {number}"),
+                description: String::new(),
+                status_id: status.into(),
+                position: number as f64,
+                created_at: 0,
+                updated_at: 0,
+                subscription_id: None,
+                pull_request: true,
+                model: None,
+                blocked_by: blocked_by.iter().map(|n| n.to_string()).collect(),
+                run: None,
+            });
+            self
+        }
+
+        fn run(mut self, number: i64, run: TaskRun) -> Plan {
+            self.state.tasks.iter_mut().find(|t| t.number == number).unwrap().run = Some(run);
+            self
+        }
+
+        fn reason(&self, number: i64) -> Option<String> {
+            self.state.waiting_reason(self.state.task(&number.to_string()).unwrap())
+        }
+    }
+
+    #[test]
+    fn starts_queued_tasks_whose_blockers_are_all_completed() {
+        let working = TaskRun::Working(RunInfo { thread_id: "t".into(), worktree: "/w".into(), branch: "b".into() });
+        let plan = Plan::new()
+            .task(21, "s", &[])
+            .task(22, "u", &[])
+            .task(23, "u", &[21])
+            .task(24, "u", &[21, 25])
+            .task(25, "c", &[])
+            .task(26, "b", &[])
+            .task(27, "u", &[25])
+            .task(28, "u", &[])
+            .run(21, working)
+            .run(28, TaskRun::Failed { error: "x".into() });
+        assert_eq!(plan.state.ready_to_start(), ["22", "27"]);
+        assert_eq!(plan.reason(23).as_deref(), Some("Waiting for ONI-21"));
+        assert_eq!(plan.reason(24).as_deref(), Some("Waiting for ONI-21"));
+        assert_eq!(plan.reason(22), None);
+        assert_eq!(plan.reason(21), None);
+    }
+
+    #[test]
+    fn names_the_blocker_that_needs_the_user() {
+        let closed = TaskRun::Review(Review { pr: pr(PrState::Closed, Mergeable::Unknown), ..review(ConflictFix::Clear) });
+        let plan = Plan::new()
+            .task(21, "s", &[])
+            .task(22, "x", &[])
+            .task(23, "s", &[])
+            .task(24, "u", &[21, 23])
+            .task(25, "u", &[22])
+            .run(21, closed)
+            .run(23, TaskRun::Failed { error: "x".into() });
+        assert_eq!(plan.reason(24).as_deref(), Some("ONI-21: pull request closed without merging; ONI-23 failed"));
+        assert_eq!(plan.reason(25).as_deref(), Some("ONI-22 was canceled"));
+        assert!(plan.state.ready_to_start().is_empty());
+    }
+
+    #[test]
+    fn follows_dependencies_transitively() {
+        let plan = Plan::new().task(1, "u", &[]).task(2, "u", &[1]).task(3, "u", &[2]);
+        assert!(plan.state.depends_on("3", "1"));
+        assert!(!plan.state.depends_on("1", "3"));
+        assert_eq!(plan.state.dependents("1").iter().map(|t| t.number).collect::<Vec<_>>(), [2]);
     }
 }

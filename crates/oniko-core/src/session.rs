@@ -33,8 +33,9 @@ pub type Emit = Arc<dyn Fn(ThreadEventBody) + Send + Sync>;
 pub struct SessionOptions {
     pub agent_id: AgentId,
     pub cwd: String,
-    /// The subscription's env (CLAUDE_CONFIG_DIR set or unset), applied last so nothing inherited survives it.
-    pub account_env: EnvLayer,
+    /// Applied last so nothing inherited survives it: the subscription's CLAUDE_CONFIG_DIR, set or unset,
+    /// and for a task's thread the project's CARGO_TARGET_DIR, so its worktrees share one build folder.
+    pub env: EnvLayer,
     pub acp_session_id: Option<String>,
     /// Values picked in the new-thread composer, applied once right after session/new and before the first prompt.
     pub initial_config: Vec<(String, String)>,
@@ -240,7 +241,7 @@ async fn connect(
 ) -> Result<Ended, String> {
     shared.status(ThreadStatus::Connecting);
     let spec = spawn_spec(state.options.agent_id)?;
-    let env = child_env(base_env(), [&spec.env, &state.options.account_env]);
+    let env = child_env(base_env(), [&spec.env, &state.options.env]);
     shared.log_line(&format!("starting {} {}", spec.command, spec.args.join(" ")));
     let mut command = tokio::process::Command::new(&spec.command);
     command

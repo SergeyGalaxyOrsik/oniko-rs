@@ -6,6 +6,7 @@ pub mod core;
 pub mod db;
 pub mod model;
 pub mod registry;
+pub mod review;
 pub mod runner;
 pub mod session;
 pub mod stores;

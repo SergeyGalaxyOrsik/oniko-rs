@@ -15,8 +15,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::db::Db;
 use crate::model::reducer::{Outcome, ThreadMap, reduce_threads};
 use crate::model::{
-    AgentId, AppEvent, AppSnapshot, SequencedEvent, Subscription, SubscriptionId, TaskId, TaskStatusId, Thread, ThreadEvent,
-    ThreadEventBody, ThreadId, ThreadStatus,
+    AgentId, AppEvent, AppSnapshot, SequencedEvent, StatusKind, Subscription, SubscriptionId, TaskId, TaskStatusId, Thread,
+    ThreadEvent, ThreadEventBody, ThreadId, ThreadStatus,
 };
 use crate::registry::{AccountSpecs, account_specs, base_env};
 use crate::session::{Emit, SessionHandle, SessionOptions, log_path_for};
@@ -65,13 +65,13 @@ impl AgentSession for SessionHandle {
 
 pub type SessionFactory = Arc<dyn Fn(SessionOptions) -> Box<dyn AgentSession> + Send + Sync>;
 
-/// Runs git in a folder: stdout on success, stderr (or the error) otherwise.
-pub type Git = Arc<dyn Fn(String, Vec<String>) -> BoxFuture<'static, Result<String, String>> + Send + Sync>;
+/// Runs a command line tool (git, gh) in a folder: stdout on success, stderr (or the error) otherwise.
+pub type Cli = Arc<dyn Fn(String, Vec<String>) -> BoxFuture<'static, Result<String, String>> + Send + Sync>;
 
-pub fn system_git() -> Git {
-    Arc::new(|cwd, args| {
+pub fn system_cli(program: &'static str) -> Cli {
+    Arc::new(move |cwd, args| {
         Box::pin(async move {
-            let out = tokio::process::Command::new("git")
+            let out = tokio::process::Command::new(program)
                 .args(&args)
                 .current_dir(&cwd)
                 .env_clear()
@@ -83,7 +83,7 @@ pub fn system_git() -> Git {
                 Ok(String::from_utf8_lossy(&out.stdout).into_owned())
             } else {
                 let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-                Err(if stderr.is_empty() { format!("git {} failed with {}", args.join(" "), out.status) } else { stderr })
+                Err(if stderr.is_empty() { format!("{program} {} failed with {}", args.join(" "), out.status) } else { stderr })
             }
         })
     })
@@ -235,15 +235,46 @@ impl CoreHandle {
             let (id, entered) = core.tasks.create(&project, &title, &description, &status_id).map_err(err)?;
             core.publish_tasks();
             core.task_entered(entered);
+            core.schedule();
             Ok(id)
         })
     }
 
-    /// The subscription can only change until the agent has started.
+    /// The subscription and model can only change until the agent has started.
     pub fn update_task(&self, id: TaskId, patch: TaskPatch) -> impl Future<Output = Result<(), String>> + use<> {
         self.command("tasks:update", move |core| {
             core.tasks.update(&id, patch).map_err(err)?;
-            core.publish_tasks();
+            core.tasks_changed();
+            Ok(())
+        })
+    }
+
+    /// `task` starts only once `blocker` is completed; the blocker is made to open a pull request.
+    pub fn add_dependency(&self, task: TaskId, blocker: TaskId) -> impl Future<Output = Result<(), String>> + use<> {
+        self.command("tasks:addDependency", move |core| {
+            core.tasks.add_dependency(&task, &blocker).map_err(err)?;
+            core.tasks_changed();
+            Ok(())
+        })
+    }
+
+    pub fn remove_dependency(&self, task: TaskId, blocker: TaskId) -> impl Future<Output = Result<(), String>> + use<> {
+        self.command("tasks:removeDependency", move |core| {
+            core.tasks.remove_dependency(&task, &blocker).map_err(err)?;
+            core.tasks_changed();
+            Ok(())
+        })
+    }
+
+    /// Queues every backlog task of the project, in order; each starts once its blockers are done.
+    pub fn run_plan(&self, project: String) -> impl Future<Output = Result<(), String>> + use<> {
+        self.command("tasks:runPlan", move |core| core.run_plan(&project))
+    }
+
+    /// Asks GitHub now about every pull request under review.
+    pub fn check_pull_requests(&self) -> impl Future<Output = Result<(), String>> + use<> {
+        self.command("tasks:checkPullRequests", |core| {
+            core.check_pull_requests();
             Ok(())
         })
     }
@@ -256,7 +287,7 @@ impl CoreHandle {
     pub fn remove_task(&self, id: TaskId) -> impl Future<Output = Result<(), String>> + use<> {
         self.command("tasks:remove", move |core| {
             core.tasks.remove(&id).map_err(err)?;
-            core.publish_tasks();
+            core.tasks_changed();
             Ok(())
         })
     }
@@ -272,7 +303,7 @@ impl CoreHandle {
     pub fn update_status(&self, id: TaskStatusId, patch: StatusPatch) -> impl Future<Output = Result<(), String>> + use<> {
         self.command("tasks:updateStatus", move |core| {
             core.tasks.update_status(&id, patch).map_err(err)?;
-            core.publish_tasks();
+            core.tasks_changed();
             Ok(())
         })
     }
@@ -281,7 +312,7 @@ impl CoreHandle {
     pub fn remove_status(&self, id: TaskStatusId) -> impl Future<Output = Result<(), String>> + use<> {
         self.command("tasks:removeStatus", move |core| {
             core.tasks.remove_status(&id).map_err(err)?;
-            core.publish_tasks();
+            core.tasks_changed();
             Ok(())
         })
     }
@@ -345,7 +376,8 @@ pub struct CoreDeps {
     pub log_dir: PathBuf,
     /// Worktrees go in `<root>/<project folder>/<branch>`.
     pub worktree_root: PathBuf,
-    pub git: Git,
+    pub git: Cli,
+    pub gh: Cli,
     pub notify: Notify,
     pub sessions: SessionFactory,
     pub telemetry: Telemetry,
@@ -362,7 +394,12 @@ pub struct Core {
     pub(crate) tasks: TaskStore,
     log_dir: PathBuf,
     pub(crate) worktree_root: PathBuf,
-    pub(crate) git: Git,
+    pub(crate) git: Cli,
+    pub(crate) gh: Cli,
+    /// Every worktree of a project shares its `.git`, so Oniko's own git commands there run one at a time.
+    git_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Checks GitHub every minute while a task is in review.
+    pub(crate) pr_poll: Option<tokio::task::JoinHandle<()>>,
     pub(crate) notify: Notify,
     session_factory: SessionFactory,
     pub(crate) telemetry: Telemetry,
@@ -390,11 +427,16 @@ impl Core {
             log_dir: deps.log_dir,
             worktree_root: deps.worktree_root,
             git: deps.git,
+            gh: deps.gh,
+            git_locks: HashMap::new(),
+            pr_poll: None,
             notify: deps.notify,
             session_factory: deps.sessions,
             telemetry: deps.telemetry,
         };
         core.fail_interrupted_starts();
+        core.resume_reviews();
+        core.schedule();
         Ok(core)
     }
 
@@ -421,6 +463,29 @@ impl Core {
     pub(crate) fn publish_tasks(&mut self) {
         let state = self.tasks.state().clone();
         self.publish(AppEvent::Tasks(state));
+    }
+
+    /// After a user edit: anything may have unblocked a queued task.
+    pub(crate) fn tasks_changed(&mut self) {
+        self.publish_tasks();
+        self.schedule();
+    }
+
+    /// Runs `work` holding the project's git lock and hands its output to `then` on the core thread.
+    /// The result is sent before the lock is released, so results arrive in the order the work ran.
+    pub(crate) fn with_git_lock<T: Send + 'static>(
+        &mut self,
+        project: &str,
+        work: impl Future<Output = T> + Send + 'static,
+        then: impl FnOnce(&mut Core, T) + Send + 'static,
+    ) {
+        let lock = self.git_locks.entry(project.to_owned()).or_default().clone();
+        let me = self.me.clone();
+        self.me.runtime.spawn(async move {
+            let _guard = lock.lock().await;
+            let output = work.await;
+            me.send(move |core| then(core, output));
+        });
     }
 
     /// Asks the UI to show a thread, e.g. after a notification about it is clicked.
@@ -457,7 +522,7 @@ impl Core {
         self.threads.values().filter(|t| t.subscription_id == subscription_id).count()
     }
 
-    fn create_thread_command(&mut self, cwd: String, subscription_id: Option<SubscriptionId>, config: Vec<(String, String)>) -> Result<ThreadId, String> {
+    pub(crate) fn create_thread_command(&mut self, cwd: String, subscription_id: Option<SubscriptionId>, config: Vec<(String, String)>) -> Result<ThreadId, String> {
         let subscription = match &subscription_id {
             Some(id) => self.subscriptions.get(id),
             None => self.subscriptions.active(),
@@ -465,11 +530,13 @@ impl Core {
         .cloned()
         .ok_or("Add a subscription in Settings")?;
         self.remember_folder(&cwd);
-        self.create_thread(&subscription, cwd, config, String::new())
+        let id = self.create_thread(&subscription, cwd, String::new());
+        self.session_with(&id, config)?.ensure();
+        Ok(id)
     }
 
-    /// Without a title, the first prompt names the thread.
-    pub(crate) fn create_thread(&mut self, subscription: &Subscription, cwd: String, config: Vec<(String, String)>, title: String) -> Result<ThreadId, String> {
+    /// Without a title, the first prompt names the thread. Its session starts on first use.
+    pub(crate) fn create_thread(&mut self, subscription: &Subscription, cwd: String, title: String) -> ThreadId {
         let id = uuid();
         let thread = Thread {
             id: id.clone(),
@@ -485,8 +552,7 @@ impl Core {
             commands: vec![],
         };
         self.dispatch(ThreadEvent { thread_id: id.clone(), body: ThreadEventBody::ThreadCreated(Box::new(thread)) });
-        self.session_with(&id, config)?.ensure();
-        Ok(id)
+        id
     }
 
     /// Sessions are created lazily, so a thread without a live process gets one on first use.
@@ -494,11 +560,15 @@ impl Core {
         self.session_with(id, vec![])
     }
 
-    fn session_with(&mut self, id: &str, initial_config: Vec<(String, String)>) -> Result<&dyn AgentSession, String> {
+    pub(crate) fn session_with(&mut self, id: &str, initial_config: Vec<(String, String)>) -> Result<&dyn AgentSession, String> {
         if !self.sessions.contains_key(id) {
             let thread = self.threads.get(id).ok_or_else(|| format!("Unknown thread {id}"))?;
             let subscription = self.subscriptions.get(&thread.subscription_id).ok_or("This thread’s subscription was removed")?;
-            let account_env = self.subscriptions.specs().get(&subscription.agent_id).map(|spec| spec.env_for(&subscription.config_dir)).unwrap_or_default();
+            let mut env = self.subscriptions.specs().get(&subscription.agent_id).map(|spec| spec.env_for(&subscription.config_dir)).unwrap_or_default();
+            if let Some(task) = self.tasks.state().task_for_thread(id) {
+                let target = std::path::Path::new(&task.project).join("target");
+                env.insert("CARGO_TARGET_DIR".into(), Some(target.to_string_lossy().into_owned()));
+            }
             let me = self.me.clone();
             let thread_id = id.to_owned();
             let emit: Emit = Arc::new(move |body| {
@@ -508,7 +578,7 @@ impl Core {
             let session = (self.session_factory)(SessionOptions {
                 agent_id: thread.agent_id,
                 cwd: thread.cwd.clone(),
-                account_env,
+                env,
                 acp_session_id: thread.acp_session_id.clone(),
                 initial_config,
                 log_path: log_path_for(&self.log_dir, id),
@@ -519,10 +589,13 @@ impl Core {
         Ok(self.sessions[id].as_ref())
     }
 
+    /// Stops the thread's agent, if it runs; the returned task ends once its process is gone.
+    pub(crate) fn dispose_session(&mut self, id: &str) -> Option<tokio::task::JoinHandle<()>> {
+        self.sessions.remove(id)?.dispose()
+    }
+
     pub(crate) fn remove_thread(&mut self, id: &str) {
-        if let Some(session) = self.sessions.remove(id) {
-            session.dispose();
-        }
+        self.dispose_session(id);
         self.dispatch(ThreadEvent { thread_id: id.to_owned(), body: ThreadEventBody::ThreadRemoved });
     }
 
@@ -587,7 +660,7 @@ impl Core {
         }
     }
 
-    fn move_task(&mut self, id: &str, status_id: &str, before_id: Option<&str>) -> Result<(), String> {
+    pub(crate) fn move_task(&mut self, id: &str, status_id: &str, before_id: Option<&str>) -> Result<(), String> {
         let (changed, entered) = self.tasks.move_task(id, status_id, before_id).map_err(err)?;
         if changed {
             self.publish_tasks();
@@ -595,6 +668,22 @@ impl Core {
         if let Some(entered) = entered {
             self.task_entered(entered);
         }
+        self.schedule();
+        Ok(())
+    }
+
+    pub(crate) fn run_plan(&mut self, project: &str) -> Result<(), String> {
+        let statuses = self.tasks.state().project_statuses(project);
+        let queue = statuses.iter().find(|s| s.kind == StatusKind::Unstarted).map(|s| s.id.clone()).ok_or("Add a Not started status first")?;
+        let backlog: Vec<String> = statuses.iter().filter(|s| s.kind == StatusKind::Backlog).map(|s| s.id.clone()).collect();
+        let drafts: Vec<String> =
+            self.tasks.state().project_tasks(project).into_iter().filter(|t| backlog.contains(&t.status_id)).map(|t| t.id.clone()).collect();
+        for id in drafts {
+            if let (_, Some(entered)) = self.tasks.move_task(&id, &queue, None).map_err(err)? {
+                self.task_entered(entered);
+            }
+        }
+        self.tasks_changed();
         Ok(())
     }
 
@@ -612,6 +701,9 @@ impl Core {
     }
 
     fn shutdown(&mut self) -> (Vec<tokio::task::JoinHandle<()>>, Telemetry) {
+        if let Some(poll) = self.pr_poll.take() {
+            poll.abort();
+        }
         let tasks = self.sessions.drain().filter_map(|(_, session)| session.dispose()).collect();
         (tasks, self.telemetry.clone())
     }
@@ -667,7 +759,8 @@ pub fn start(options: StartOptions) -> Result<(CoreHandle, mpsc::UnboundedReceiv
                     seed: Some((AgentId::Claude, home_dir().join(".claude").to_string_lossy().into_owned())),
                     log_dir,
                     worktree_root: options.worktree_root.clone(),
-                    git: system_git(),
+                    git: system_cli("git"),
+                    gh: system_cli("gh"),
                     notify: options.notify.clone(),
                     sessions: Arc::new(|options| Box::new(SessionHandle::spawn(options)) as Box<dyn AgentSession>),
                     telemetry,
@@ -720,6 +813,15 @@ pub(crate) mod testing {
         calls: Arc<Mutex<Vec<Call>>>,
     }
 
+    pub type Reply = Arc<Mutex<Result<String, String>>>;
+
+    #[derive(Debug, Clone)]
+    pub struct Spawned {
+        pub cwd: String,
+        pub env: crate::registry::EnvLayer,
+        pub initial_config: Vec<(String, String)>,
+    }
+
     impl AgentSession for FakeSession {
         fn ensure(&self) {
             self.calls.lock().unwrap().push(Call::Ensure(self.cwd.clone()));
@@ -752,6 +854,10 @@ pub(crate) mod testing {
         pub _events: mpsc::UnboundedReceiver<SequencedEvent>,
         pub calls: Arc<Mutex<Vec<Call>>>,
         pub notices: Arc<Mutex<Vec<TaskNotice>>>,
+        /// What every gh call answers; `[]` until a test sets it.
+        pub gh: Reply,
+        /// What each session the core created was given.
+        pub spawned: Arc<Mutex<Vec<Spawned>>>,
         pub dir: tempfile::TempDir,
     }
 
@@ -769,6 +875,10 @@ pub(crate) mod testing {
             let session_calls = calls.clone();
             let git = Arc::new(git);
             let recorded_notices = notices.clone();
+            let gh: Reply = Arc::new(Mutex::new(Ok("[]".into())));
+            let gh_reply = gh.clone();
+            let spawned: Arc<Mutex<Vec<Spawned>>> = Arc::default();
+            let recorded_spawns = spawned.clone();
             let deps = CoreDeps {
                 db: Rc::new(Db::in_memory().unwrap()),
                 specs: fake_specs(vec![]),
@@ -779,12 +889,19 @@ pub(crate) mod testing {
                     let result = git(&cwd, &args);
                     Box::pin(async move { result })
                 }),
+                gh: Arc::new(move |_, _| {
+                    let result = gh_reply.lock().unwrap().clone();
+                    Box::pin(async move { result })
+                }),
                 notify: Arc::new(move |notice| recorded_notices.lock().unwrap().push(notice)),
-                sessions: Arc::new(move |options| Box::new(FakeSession { cwd: options.cwd, calls: session_calls.clone() }) as Box<dyn AgentSession>),
+                sessions: Arc::new(move |options| {
+                    recorded_spawns.lock().unwrap().push(Spawned { cwd: options.cwd.clone(), env: options.env, initial_config: options.initial_config });
+                    Box::new(FakeSession { cwd: options.cwd, calls: session_calls.clone() }) as Box<dyn AgentSession>
+                }),
                 telemetry: Telemetry::disabled(Arc::new(NoSettings)),
             };
             let core = Core::new(deps, me, event_tx).unwrap();
-            Harness { core, jobs, _events: events, calls, notices, dir }
+            Harness { core, jobs, _events: events, calls, notices, gh, spawned, dir }
         }
 
         /// Runs queued jobs until nothing more arrives for a moment, as the core thread would.

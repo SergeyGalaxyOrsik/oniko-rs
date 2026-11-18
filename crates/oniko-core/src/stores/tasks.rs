@@ -16,6 +16,8 @@ pub struct TaskPatch {
     /// `Some(None)` clears it back to "whichever is active".
     pub subscription_id: Option<Option<SubscriptionId>>,
     pub pull_request: Option<bool>,
+    /// `Some(None)` clears it back to "the last thread's model".
+    pub model: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -103,6 +105,8 @@ impl TaskStore {
             updated_at: now,
             subscription_id: None,
             pull_request: false,
+            model: None,
+            blocked_by: vec![],
             run: None,
         })?;
         self.reload()?;
@@ -117,6 +121,17 @@ impl TaskStore {
         {
             bail!("The agent already started on its subscription");
         }
+        if let Some(model) = &patch.model
+            && *model != task.model
+            && task.thread_id().is_some()
+        {
+            bail!("The agent already started on its model");
+        }
+        if patch.pull_request == Some(false)
+            && let Some(dependent) = self.current.dependents(id).first()
+        {
+            bail!("{} waits for this pull request; remove that link first", dependent.key());
+        }
         if let Some(title) = &patch.title {
             task.title = require_title(title)?;
         }
@@ -128,6 +143,9 @@ impl TaskStore {
         }
         if let Some(pull_request) = patch.pull_request {
             task.pull_request = pull_request;
+        }
+        if let Some(model) = patch.model {
+            task.model = model;
         }
         task.updated_at = now_ms();
         self.db.save_task(&task)?;
@@ -164,6 +182,31 @@ impl TaskStore {
 
     pub fn remove(&mut self, id: &str) -> Result<()> {
         self.db.delete_task(id)?;
+        self.reload()
+    }
+
+    /// `task` waits for `blocker`'s pull request to merge, so the blocker is made to open one.
+    pub fn add_dependency(&mut self, task_id: &str, blocker_id: &str) -> Result<()> {
+        let task = self.task(task_id)?;
+        let blocker = self.task(blocker_id)?;
+        if task.project != blocker.project {
+            bail!("A task can only wait for a task of the same project");
+        }
+        if task_id == blocker_id {
+            bail!("A task cannot wait for itself");
+        }
+        if self.current.depends_on(blocker_id, task_id) {
+            bail!("{} already waits for {}", blocker.key(), task.key());
+        }
+        if !blocker.pull_request {
+            self.db.save_task(&Task { pull_request: true, updated_at: now_ms(), ..blocker.clone() })?;
+        }
+        self.db.add_dependency(task_id, blocker_id)?;
+        self.reload()
+    }
+
+    pub fn remove_dependency(&mut self, task_id: &str, blocker_id: &str) -> Result<()> {
+        self.db.remove_dependency(task_id, blocker_id)?;
         self.reload()
     }
 
@@ -336,6 +379,34 @@ mod tests {
     }
 
     #[test]
+    fn links_tasks_of_one_project_without_cycles() {
+        let mut o = opened();
+        let (a, _) = o.store.create(PROJECT, "a", "", &o.backlog).unwrap();
+        let (b, _) = o.store.create(PROJECT, "b", "", &o.backlog).unwrap();
+        let (c, _) = o.store.create(PROJECT, "c", "", &o.backlog).unwrap();
+        o.store.add_dependency(&b, &a).unwrap();
+        o.store.add_dependency(&c, &b).unwrap();
+        assert!(o.store.get(&a).unwrap().pull_request, "a blocker always opens a pull request");
+        for (task, blocker) in [(&a, &c), (&a, &b)] {
+            assert!(o.store.add_dependency(task, blocker).unwrap_err().to_string().contains("already waits"), "{task} <- {blocker}");
+        }
+        assert!(o.store.add_dependency(&a, &a).unwrap_err().to_string().contains("itself"));
+        o.store.open("/other").unwrap();
+        let other_status = o.store.state().project_statuses("/other")[0].id.clone();
+        let (other, _) = o.store.create("/other", "x", "", &other_status).unwrap();
+        assert!(o.store.add_dependency(&other, &a).unwrap_err().to_string().contains("same project"));
+        let error = o.store.update(&a, TaskPatch { pull_request: Some(false), ..Default::default() }).unwrap_err();
+        assert!(error.to_string().contains("ONI-2 waits"), "{error}");
+        let reopened = TaskStore::new(o.db.clone()).unwrap();
+        assert_eq!(reopened.get(&c).unwrap().blocked_by, std::slice::from_ref(&b));
+        o.store.remove(&b).unwrap();
+        let reopened = TaskStore::new(o.db.clone()).unwrap();
+        assert!(reopened.get(&c).unwrap().blocked_by.is_empty());
+        assert!(reopened.state().dependents(&a).is_empty());
+        o.store.update(&a, TaskPatch { pull_request: Some(false), ..Default::default() }).unwrap();
+    }
+
+    #[test]
     fn persists_the_agent_fields_and_guards_the_subscription() {
         let mut o = opened();
         let (id, _) = o.store.create(PROJECT, "a", "", &o.backlog).unwrap();
@@ -348,5 +419,17 @@ mod tests {
         assert_eq!((saved.subscription_id.as_deref(), saved.pull_request, saved.run), (Some("sub-1"), true, Some(run)));
         let error = o.store.update(&id, TaskPatch { subscription_id: Some(None), ..Default::default() }).unwrap_err();
         assert!(error.to_string().contains("already started"));
+    }
+
+    #[test]
+    fn the_model_is_fixed_once_the_agent_started() {
+        let mut o = opened();
+        let (id, _) = o.store.create(PROJECT, "a", "", &o.backlog).unwrap();
+        o.store.update(&id, TaskPatch { model: Some(Some("opus".into())), ..Default::default() }).unwrap();
+        assert_eq!(TaskStore::new(o.db.clone()).unwrap().get(&id).unwrap().model.as_deref(), Some("opus"));
+        o.store.set_run(&id, Some(TaskRun::Working(RunInfo { thread_id: "t-1".into(), worktree: "/w".into(), branch: "b".into() }))).unwrap();
+        let error = o.store.update(&id, TaskPatch { model: Some(Some("haiku".into())), ..Default::default() }).unwrap_err();
+        assert!(error.to_string().contains("already started"));
+        o.store.update(&id, TaskPatch { model: Some(Some("opus".into())), ..Default::default() }).unwrap();
     }
 }
