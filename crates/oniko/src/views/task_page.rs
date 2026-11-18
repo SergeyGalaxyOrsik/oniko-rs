@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use gpui::{AnyElement, App, AsyncApp, Context, Corner, Entity, EventEmitter, FontWeight, IntoElement, SharedString, Task as GpuiTask, WeakEntity, Window, div, prelude::*, px};
 use oniko_core::model::config::new_thread_config;
+use oniko_core::model::reducer::AppState;
 use oniko_core::model::{ConfigChoice, StatusKind, Task, TaskId, TaskRun, TaskStatus, ThreadStatus};
 use oniko_core::stores::tasks::TaskPatch;
 
@@ -169,18 +170,10 @@ impl TaskPage {
         let t = theme(cx);
         let state = &store(cx).read(cx).state;
         let thread = task.thread_id().and_then(|id| state.threads.get(id));
-        let subscription = thread
-            .and_then(|th| state.subscriptions.get(&th.subscription_id))
-            .or_else(|| task.subscription_id.as_deref().and_then(|id| state.subscriptions.get(id)))
-            .or_else(|| state.subscriptions.active());
-        let choices: Option<Vec<ConfigChoice>> = subscription
-            .map(|s| new_thread_config(state.threads.values(), s.agent_id, &s.id))
-            .and_then(|config| config.into_iter().find(|c| c.id == "model"))
-            .map(|c| c.options);
-        let name = |value: &str| choices.iter().flatten().find(|o| o.value == value).map_or(value.to_owned(), |o| o.label.clone());
+        let choices = model_choices(task, state);
         let shown = match thread.and_then(|th| th.config.iter().find(|c| c.id == "model")) {
             Some(control) => control.options.iter().find(|o| o.value == control.value).map_or(control.value.clone(), |o| o.label.clone()),
-            None => task.model.as_deref().map_or("Last used".to_owned(), name),
+            None => task.model.as_deref().map_or("Last used".to_owned(), |m| model_name(m, choices.as_deref())),
         };
         let label = div()
             .flex()
@@ -326,6 +319,7 @@ impl TaskPage {
         let hint = |text: String| div().px_2().text_xs().text_color(t.muted_foreground).line_height(px(18.)).child(text).into_any_element();
         let queue = statuses.iter().find(|s| s.kind == StatusKind::Unstarted).map_or("a Not started status".to_owned(), |s| s.name.clone());
         let waiting = store(cx).read(cx).state.tasks.waiting_reason(task);
+        let queued = statuses.iter().any(|s| s.id == task.status_id && s.kind == StatusKind::Unstarted);
         match &task.run {
             None => match waiting {
                 Some(reason) => div()
@@ -333,7 +327,11 @@ impl TaskPage {
                     .flex_col()
                     .gap_1()
                     .child(div().px_2().text_sm().child(reason))
-                    .child(hint(format!("It starts in {queue} once every task it waits for is done.")))
+                    .child(hint(if queued {
+                        "It starts on its own once every task it waits for is done.".to_owned()
+                    } else {
+                        format!("Move it to {queue}, and it starts once every task it waits for is done.")
+                    }))
                     .into_any_element(),
                 None => hint(format!("Move the task to {queue} to start an agent on it in its own worktree.")),
             },
@@ -410,6 +408,21 @@ impl TaskPage {
             }
         }
     }
+}
+
+/// The models the task's agent offered on its newest thread; None until that agent has run once.
+pub fn model_choices(task: &Task, state: &AppState) -> Option<Vec<ConfigChoice>> {
+    let subscription = task
+        .thread_id()
+        .and_then(|id| state.threads.get(id))
+        .and_then(|th| state.subscriptions.get(&th.subscription_id))
+        .or_else(|| task.subscription_id.as_deref().and_then(|id| state.subscriptions.get(id)))
+        .or_else(|| state.subscriptions.active())?;
+    new_thread_config(state.threads.values(), subscription.agent_id, &subscription.id).into_iter().find(|c| c.id == "model").map(|c| c.options)
+}
+
+pub fn model_name(value: &str, choices: Option<&[ConfigChoice]>) -> String {
+    choices.into_iter().flatten().find(|o| o.value == value).map_or(value.to_owned(), |o| o.label.clone())
 }
 
 fn property(label: &str, body: impl IntoElement, cx: &App) -> impl IntoElement {

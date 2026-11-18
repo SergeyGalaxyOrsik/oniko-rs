@@ -141,7 +141,7 @@ impl Progress {
     /// One muted line; a pull request links to GitHub, and one under review can be checked now.
     pub fn render(self, id: &str, cx: &App) -> AnyElement {
         let t = theme(cx);
-        let line = div().flex().items_center().gap_1p5().min_w_0().text_xs().text_color(t.muted_foreground);
+        let line = div().flex().flex_wrap().items_center().gap_x_1p5().min_w_0().text_xs().text_color(t.muted_foreground);
         match self {
             Progress::Waiting(reason) => line.child(div().truncate().child(reason)).into_any_element(),
             Progress::Stage(stage) => line.child(div().truncate().child(stage)).into_any_element(),

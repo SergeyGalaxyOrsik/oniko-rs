@@ -46,6 +46,7 @@ pub enum Icon {
     SquarePen,
     SquareTerminal,
     Trash,
+    Workflow,
     Wrench,
     X,
 }
@@ -95,6 +96,7 @@ impl Icon {
             Icon::SquarePen => "icons/square-pen.svg",
             Icon::SquareTerminal => "icons/square-terminal.svg",
             Icon::Trash => "icons/trash.svg",
+            Icon::Workflow => "icons/workflow.svg",
             Icon::Wrench => "icons/wrench.svg",
             Icon::X => "icons/x.svg",
         }
