@@ -613,6 +613,15 @@ impl Core {
             if let Some(task) = self.tasks.state().task_for_thread(id) {
                 env.insert("CARGO_TARGET_DIR".into(), Some(target_dir(&task.project).to_string_lossy().into_owned()));
             }
+            // The agent resumes a session on its default model, so a re-created session (after parking,
+            // a restart or a crash) gets the thread's last values back. Mode goes last: the adapter
+            // judges a mode against the model already set.
+            let initial_config = if initial_config.is_empty() {
+                let (modes, rest): (Vec<_>, Vec<_>) = thread.config.iter().map(|c| (c.id.clone(), c.value.clone())).partition(|(id, _)| id == "mode");
+                rest.into_iter().chain(modes).collect()
+            } else {
+                initial_config
+            };
             let me = self.me.clone();
             let thread_id = id.to_owned();
             let emit: Emit = Arc::new(move |body| {

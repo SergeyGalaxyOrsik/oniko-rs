@@ -733,8 +733,23 @@ mod tests {
         let b = board(&mut h, &repo);
         let (id, thread, worktree) = into_review(&mut h, &b, "Ship it").await;
         assert!(!worktree.exists());
+        let control = |id: &str, value: &str| ConfigControl {
+            id: id.into(),
+            label: id.into(),
+            category: None,
+            source: ConfigSource::ConfigOption,
+            value: value.into(),
+            options: vec![ConfigChoice { value: value.into(), label: value.into(), description: None }],
+        };
+        h.core.dispatch(ThreadEvent { thread_id: thread.clone(), body: ThreadEventBody::Config(vec![control("mode", "auto"), control("model", "sonnet")]) });
         h.core.prompt_thread(&thread, "Rename the flag".into()).unwrap();
         h.settle().await;
+        let respawned = h.spawned.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            respawned.initial_config,
+            [("model".to_owned(), "sonnet".to_owned()), ("mode".to_owned(), "auto".to_owned())],
+            "a re-created session keeps the thread's model, with the mode last"
+        );
         assert!(worktree.exists(), "the worktree comes back at the same path");
         assert_eq!(review(&h, &id).worktree.as_deref(), Some(worktree.to_str().unwrap()));
         let asked = Call::Prompt(worktree.to_string_lossy().into_owned(), "Rename the flag".into());
