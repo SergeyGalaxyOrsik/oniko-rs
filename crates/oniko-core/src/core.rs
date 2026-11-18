@@ -160,7 +160,7 @@ impl CoreHandle {
     }
 
     pub fn prompt(&self, id: ThreadId, text: String) -> impl Future<Output = Result<(), String>> + use<> {
-        self.command("threads:prompt", move |core| core.session(&id).map(|s| s.prompt(text)))
+        self.command("threads:prompt", move |core| core.prompt_thread(&id, text))
     }
 
     pub fn cancel(&self, id: ThreadId) -> impl Future<Output = Result<(), String>> + use<> {

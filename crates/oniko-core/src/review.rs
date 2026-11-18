@@ -8,7 +8,8 @@ use serde::Deserialize;
 
 use crate::core::Core;
 use crate::model::{
-    ConflictFix, Mergeable, Merged, PrState, PullRequest, Review, ReviewAction, RunInfo, StatusKind, Task, TaskRun,
+    ConflictFix, Mergeable, Merged, NoticeLevel, PrState, PullRequest, Review, ReviewAction, RunInfo, StatusKind, Task, TaskRun,
+    ThreadEvent, ThreadEventBody,
 };
 use crate::runner::{argv, conflict_prompt, fetch_base, worktree_for, worktree_path};
 
@@ -103,9 +104,36 @@ impl Core {
         self.ensure_polling();
     }
 
+    /// A prompt the user sends from a thread. A task under review may have its worktree parked, or on
+    /// its way out, so the folder is brought back first under the git lock; the turn's end parks it again.
+    pub(crate) fn prompt_thread(&mut self, thread_id: &str, text: String) -> Result<(), String> {
+        let Some(task) = self.tasks.state().task_for_thread(thread_id).cloned() else { return self.session(thread_id).map(|s| s.prompt(text)) };
+        let Some(TaskRun::Review(review)) = &task.run else { return self.session(thread_id).map(|s| s.prompt(text)) };
+        let path = worktree_path(&self.worktree_root, &task.project, &review.branch);
+        let work = worktree_for(self.git.clone(), task.project.clone(), path, review.branch.clone());
+        let (id, thread_id) = (task.id.clone(), thread_id.to_owned());
+        self.with_git_lock(&task.project, work, move |core, result| core.restored_for_prompt(&id, &thread_id, text, result));
+        Ok(())
+    }
+
+    fn restored_for_prompt(&mut self, id: &str, thread_id: &str, text: String, result: Result<String, String>) {
+        match result {
+            Ok(worktree) => {
+                self.update_review(id, |r| r.worktree = Some(worktree));
+                if let Ok(session) = self.session(thread_id) {
+                    session.prompt(text);
+                }
+            }
+            Err(error) => {
+                let body = ThreadEventBody::Notice { level: NoticeLevel::Error, text: format!("Could not bring back the worktree: {error}") };
+                self.dispatch(ThreadEvent { thread_id: thread_id.to_owned(), body });
+            }
+        }
+    }
+
     /// While the pull request waits its folder is not needed: a clean worktree is removed, the branch
     /// stays. The agent is stopped first so no process sits in a deleted folder.
-    fn park(&mut self, project: &str, id: &str, review: &Review) {
+    pub(crate) fn park(&mut self, project: &str, id: &str, review: &Review) {
         let Some(worktree) = review.worktree.clone() else { return };
         let stopped = self.dispose_session(&review.thread_id);
         let (git, repo, id) = (self.git.clone(), project.to_owned(), id.to_owned());

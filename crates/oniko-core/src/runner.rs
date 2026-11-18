@@ -240,6 +240,7 @@ impl Core {
                 TaskRun::Finished(_) => self.notify_task(thread_id, format!("{key}: the agent finished"), task.title.clone()),
                 TaskRun::PullRequest(info) => self.find_pull_request(&task, info),
                 TaskRun::Review(review) if review.conflict_fix == ConflictFix::Fixing => self.conflict_turn_ended(&task, review),
+                TaskRun::Review(review) => self.park(&task.project, &task.id, &review),
                 _ => {}
             },
             _ => {}
@@ -592,6 +593,45 @@ mod tests {
         h.core.check_pull_requests();
         h.settle().await;
         assert_eq!(review(&h, &id).conflict_fix, ConflictFix::Clear);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_in_a_parked_review_thread_brings_the_worktree_back_until_the_turn_ends() {
+        let mut h = real_git();
+        let repo = h.dir.path().join("app");
+        init_repo(&repo);
+        let b = board(&mut h, &repo);
+        let (id, thread, worktree) = into_review(&mut h, &b, "Ship it").await;
+        assert!(!worktree.exists());
+        h.core.prompt_thread(&thread, "Rename the flag".into()).unwrap();
+        h.settle().await;
+        assert!(worktree.exists(), "the worktree comes back at the same path");
+        assert_eq!(review(&h, &id).worktree.as_deref(), Some(worktree.to_str().unwrap()));
+        let asked = Call::Prompt(worktree.to_string_lossy().into_owned(), "Rename the flag".into());
+        assert!(h.calls().contains(&asked), "{:?}", h.calls());
+        turn_end(&mut h, &thread, "end_turn");
+        h.settle().await;
+        assert!(!worktree.exists(), "parked again once the turn ends");
+        assert_eq!(review(&h, &id).worktree, None);
+    }
+
+    #[tokio::test]
+    async fn a_worktree_that_cannot_come_back_is_reported_in_the_thread_and_the_prompt_is_not_sent() {
+        let mut h = real_git();
+        let repo = h.dir.path().join("app");
+        init_repo(&repo);
+        let b = board(&mut h, &repo);
+        let (_, thread, worktree) = into_review(&mut h, &b, "Ship it").await;
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("stray.txt"), "not a worktree").unwrap();
+        h.core.prompt_thread(&thread, "Rename the flag".into()).unwrap();
+        h.settle().await;
+        assert!(!prompts(&h).iter().any(|p| p == "Rename the flag"));
+        let notice = h.core.threads[&thread].timeline.iter().find_map(|item| match item {
+            crate::model::TimelineItem::Notice { level: crate::model::NoticeLevel::Error, text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        assert!(notice.as_deref().is_some_and(|t| t.contains("is not a worktree")), "{notice:?}");
     }
 
     #[tokio::test]
