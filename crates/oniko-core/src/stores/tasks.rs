@@ -288,7 +288,7 @@ mod tests {
         assert!(store.open(PROJECT).unwrap());
         assert!(!store.open(PROJECT).unwrap());
         let ids: Vec<String> = store.state().project_statuses(PROJECT).iter().map(|s| s.id.clone()).collect();
-        Opened { db, store, backlog: ids[0].clone(), todo: ids[1].clone(), done: ids[3].clone() }
+        Opened { db, store, backlog: ids[0].clone(), todo: ids[1].clone(), done: ids[4].clone() }
     }
 
     fn titles(store: &TaskStore, status: &str) -> Vec<String> {
@@ -299,9 +299,9 @@ mod tests {
     fn seeds_the_default_statuses_once_per_project() {
         let o = opened();
         let names: Vec<&str> = o.store.state().project_statuses(PROJECT).iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["Backlog", "To do", "In progress", "Done"]);
+        assert_eq!(names, ["Backlog", "To do", "In progress", "In review", "Done"]);
         let kinds: Vec<StatusKind> = o.store.state().project_statuses(PROJECT).iter().map(|s| s.kind).collect();
-        assert_eq!(kinds, [StatusKind::Backlog, StatusKind::Unstarted, StatusKind::Started, StatusKind::Completed]);
+        assert_eq!(kinds, [StatusKind::Backlog, StatusKind::Unstarted, StatusKind::Started, StatusKind::Review, StatusKind::Completed]);
         assert!(o.store.state().project_statuses("/other").is_empty());
     }
 

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::subscriptions::SubscriptionId;
-use super::thread::{Thread, ThreadId};
+use super::thread::{Thread, ThreadId, ThreadStatus};
 
 pub type TaskId = String;
 pub type TaskStatusId = String;
@@ -58,19 +58,22 @@ pub enum StatusKind {
     Backlog,
     Unstarted,
     Started,
+    /// A pull request waits for review; not done, so the tasks after it keep waiting.
+    Review,
     Completed,
     Canceled,
 }
 
 impl StatusKind {
-    pub const ALL: [StatusKind; 5] =
-        [StatusKind::Backlog, StatusKind::Unstarted, StatusKind::Started, StatusKind::Completed, StatusKind::Canceled];
+    pub const ALL: [StatusKind; 6] =
+        [StatusKind::Backlog, StatusKind::Unstarted, StatusKind::Started, StatusKind::Review, StatusKind::Completed, StatusKind::Canceled];
 
     pub fn as_str(self) -> &'static str {
         match self {
             StatusKind::Backlog => "backlog",
             StatusKind::Unstarted => "unstarted",
             StatusKind::Started => "started",
+            StatusKind::Review => "review",
             StatusKind::Completed => "completed",
             StatusKind::Canceled => "canceled",
         }
@@ -85,6 +88,7 @@ impl StatusKind {
             StatusKind::Backlog => "Backlog",
             StatusKind::Unstarted => "Not started",
             StatusKind::Started => "In progress",
+            StatusKind::Review => "In review",
             StatusKind::Completed => "Completed",
             StatusKind::Canceled => "Canceled",
         }
@@ -296,10 +300,11 @@ pub struct TasksState {
 }
 
 /// Every project starts with these; the user can rename, remove or add to them.
-pub const DEFAULT_STATUSES: [(&str, StatusColor, StatusKind); 4] = [
+pub const DEFAULT_STATUSES: [(&str, StatusColor, StatusKind); 5] = [
     ("Backlog", StatusColor::Slate, StatusKind::Backlog),
     ("To do", StatusColor::Slate, StatusKind::Unstarted),
     ("In progress", StatusColor::Amber, StatusKind::Started),
+    ("In review", StatusColor::Green, StatusKind::Review),
     ("Done", StatusColor::Violet, StatusKind::Completed),
 ];
 
@@ -400,6 +405,20 @@ impl TasksState {
             return Some(stuck.join("; "));
         }
         Some(format!("Waiting for {}", pending.iter().map(|b| b.key()).collect::<Vec<_>>().join(", ")))
+    }
+
+    /// Why the project's shared build folder cannot be cleaned now: an agent of one of its tasks may be
+    /// building in it, and cleaning under a running build breaks it.
+    pub fn clean_build_blocker(&self, project: &str, threads: &HashMap<ThreadId, Thread>) -> Option<String> {
+        let busy = self.tasks.iter().filter(|t| t.project == project).find(|t| {
+            let at_work = match &t.run {
+                Some(TaskRun::Working(_) | TaskRun::PullRequest(_)) => true,
+                Some(TaskRun::Review(review)) => review.conflict_fix == ConflictFix::Fixing,
+                _ => false,
+            };
+            at_work || t.thread_id().and_then(|id| threads.get(id)).is_some_and(|th| matches!(th.status, ThreadStatus::Running { .. } | ThreadStatus::AwaitingPermission { .. }))
+        })?;
+        Some(format!("{}'s agent is working; clean once it stops", busy.key()))
     }
 
     /// Whether `task` waits on `other`, directly or through other tasks.

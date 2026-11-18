@@ -4,15 +4,16 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::core::{Cli, Core, TaskNotice};
+use crate::core::{Cli, Core, TaskNotice, auto_mode_key};
 use crate::model::config::new_thread_config;
-use crate::model::{ConflictFix, RunInfo, StatusKind, Subscription, Task, TaskRun, ThreadEvent, ThreadEventBody, ThreadStatus};
+use crate::model::{AppEvent, ConflictFix, RunInfo, StatusKind, Subscription, Task, TaskRun, ThreadEvent, ThreadEventBody, ThreadStatus};
 use crate::stores::tasks::Entered;
 use crate::util::{basename, resolve};
 
 /// The Claude adapter's permission mode where a classifier approves commands instead of the user.
 /// On a model without auto mode the adapter falls back to accepting edits and asks for the rest.
 const TASK_MODE: (&str, &str) = ("mode", "auto");
+const AUTO_MODE_FALLBACK: &str = "acceptEdits";
 
 pub fn task_prompt(task: &Task, branch: &str) -> String {
     [
@@ -118,6 +119,17 @@ impl Core {
         }
     }
 
+    /// Moves the task to the project's first status of `kind`; a project without one leaves it where it is.
+    pub(crate) fn move_to_first(&mut self, id: &str, kind: StatusKind) {
+        let Some(task) = self.tasks.get(id) else { return };
+        let target = self.tasks.state().project_statuses(&task.project).into_iter().find(|s| s.kind == kind).map(|s| s.id.clone());
+        if let Some(target) = target
+            && let Ok((true, _)) = self.tasks.move_task(id, &target, None)
+        {
+            self.publish_tasks();
+        }
+    }
+
     pub(crate) fn notify_task(&self, thread_id: &str, title: String, body: String) {
         (self.notify)(TaskNotice { title, body, thread_id: thread_id.to_owned() });
     }
@@ -189,16 +201,56 @@ impl Core {
         let thread_id = self.create_thread(&subscription, worktree.clone(), format!("{}: {}", task.key(), task.title));
         // Recorded before the session exists, which looks the task up for its env.
         self.set_run(id, Some(TaskRun::Working(RunInfo { thread_id: thread_id.clone(), worktree, branch: branch.clone() })));
-        let started = self.tasks.state().project_statuses(&task.project).into_iter().find(|s| s.kind == StatusKind::Started).map(|s| s.id.clone());
-        if let Some(started) = started
-            && let Ok((changed, _)) = self.tasks.move_task(id, &started, None)
-            && changed
-        {
-            self.publish_tasks();
-        }
+        self.move_to_first(id, StatusKind::Started);
+        self.auto_mode_watch.insert(thread_id.clone());
         match self.session_with(&thread_id, config) {
             Ok(session) => session.prompt(task_prompt(&task, &branch)),
             Err(error) => self.set_run(id, Some(TaskRun::Failed { error })),
+        }
+    }
+
+    pub(crate) fn mode_of(&self, thread_id: &str) -> Option<String> {
+        self.threads.get(thread_id)?.config.iter().find(|c| c.id == TASK_MODE.0).map(|c| c.value.clone())
+    }
+
+    /// Learns from a task thread's config whether its model has auto mode. Showing `auto` proves it. The
+    /// adapter's fallback shows as the mode turning into `acceptEdits` while `auto` is on offer; a session
+    /// that merely starts in `acceptEdits`, the user's default, says nothing. The first turn's end, or a
+    /// fallback, ends the watch, so the user hears of it once per thread.
+    pub(crate) fn watch_auto_mode(&mut self, event: &ThreadEvent, mode_before: Option<String>) {
+        let thread_id = event.thread_id.as_str();
+        if matches!(event.body, ThreadEventBody::TurnEnd { .. } | ThreadEventBody::ThreadRemoved) {
+            self.auto_mode_watch.remove(thread_id);
+            return;
+        }
+        let Some(thread) = self.threads.get(thread_id) else { return };
+        let control = |id: &str| thread.config.iter().find(|c| c.id == id);
+        let (Some(mode), Some(model)) = (control(TASK_MODE.0), control("model")) else { return };
+        if !mode.options.iter().any(|o| o.value == TASK_MODE.1) {
+            return;
+        }
+        let supported = if mode.value == TASK_MODE.1 {
+            true
+        } else if mode.value == AUTO_MODE_FALLBACK && mode_before.as_deref().is_some_and(|before| before != AUTO_MODE_FALLBACK) {
+            false
+        } else {
+            return;
+        };
+        let agent = thread.agent_id;
+        let model_name = model.options.iter().find(|o| o.value == model.value).map_or(model.value.clone(), |o| o.label.clone());
+        if self.auto_modes.record(agent, &model.value, supported) {
+            if let Err(error) = self.db.set_setting(&auto_mode_key(agent), &self.auto_modes.of(agent)) {
+                eprintln!("oniko: could not save which models have auto mode: {error:#}");
+            }
+            self.publish(AppEvent::AutoModes(self.auto_modes.clone()));
+        }
+        if supported {
+            return;
+        }
+        self.auto_mode_watch.remove(thread_id);
+        if let Some(task) = self.tasks.state().task_for_thread(thread_id) {
+            let title = format!("{}: {model_name} has no auto mode, so the agent asks before running commands", task.key());
+            self.notify_task(thread_id, title, task.title.clone());
         }
     }
 
@@ -235,6 +287,7 @@ impl Core {
                 TaskRun::Finished(_) => self.notify_task(thread_id, format!("{key}: the agent finished"), task.title.clone()),
                 TaskRun::PullRequest(info) => self.find_pull_request(&task, info),
                 TaskRun::Review(review) if review.conflict_fix == ConflictFix::Fixing => self.conflict_turn_ended(&task, review),
+                TaskRun::Review(review) => self.park(&task.project, &task.id, &review),
                 _ => {}
             },
             _ => {}
@@ -297,6 +350,7 @@ mod tests {
         backlog: String,
         todo: String,
         in_progress: String,
+        in_review: String,
         done: String,
     }
 
@@ -304,7 +358,7 @@ mod tests {
         let project = project.to_string_lossy().into_owned();
         h.core.tasks.open(&project).unwrap();
         let ids: Vec<String> = h.core.tasks.state().project_statuses(&project).iter().map(|s| s.id.clone()).collect();
-        Board { project, backlog: ids[0].clone(), todo: ids[1].clone(), in_progress: ids[2].clone(), done: ids[3].clone() }
+        Board { project, backlog: ids[0].clone(), todo: ids[1].clone(), in_progress: ids[2].clone(), in_review: ids[3].clone(), done: ids[4].clone() }
     }
 
     fn create(h: &mut Harness, b: &Board, title: &str, description: &str, status: &str) -> String {
@@ -509,6 +563,58 @@ mod tests {
         assert_eq!(spawned.initial_config, [("model".to_owned(), "opus".to_owned()), ("mode".to_owned(), "auto".to_owned())]);
     }
 
+    fn config(model: &str, mode: &str) -> ThreadEventBody {
+        let choice = |value: &str, label: &str| ConfigChoice { value: value.into(), label: label.into(), description: None };
+        let control = |id: &str, value: &str, options: Vec<ConfigChoice>| ConfigControl {
+            id: id.into(),
+            label: id.into(),
+            category: Some(id.into()),
+            source: ConfigSource::ConfigOption,
+            value: value.into(),
+            options,
+        };
+        ThreadEventBody::Config(vec![
+            control("model", model, vec![choice("haiku", "Haiku"), choice("opus", "Opus")]),
+            control("mode", mode, vec![choice("default", "Default"), choice("acceptEdits", "Accept edits"), choice("auto", "Auto")]),
+        ])
+    }
+
+    #[tokio::test]
+    async fn learns_from_task_threads_which_models_have_auto_mode_and_tells_once_per_thread() {
+        let mut h = real_git();
+        let repo = h.dir.path().join("app");
+        init_repo(&repo);
+        let b = board(&mut h, &repo);
+        let first = create(&mut h, &b, "On Haiku", "", &b.todo);
+        h.settle().await;
+        let thread = thread_of(&h, &first);
+        let send = |h: &mut Harness, thread: &str, body: ThreadEventBody| h.core.dispatch(ThreadEvent { thread_id: thread.into(), body });
+        let has_auto = |h: &Harness, model: &str| h.core.auto_modes.get(crate::model::AgentId::Claude, model);
+        let fallbacks = |h: &Harness| notice_titles(h).into_iter().filter(|t| t.contains("no auto mode")).collect::<Vec<_>>();
+
+        send(&mut h, &thread, config("haiku", "default"));
+        assert_eq!(has_auto(&h, "haiku"), None);
+        send(&mut h, &thread, config("haiku", "acceptEdits"));
+        assert_eq!(has_auto(&h, "haiku"), Some(false));
+        send(&mut h, &thread, config("haiku", "default"));
+        send(&mut h, &thread, config("haiku", "acceptEdits"));
+        assert_eq!(fallbacks(&h), ["APP-1: Haiku has no auto mode, so the agent asks before running commands"]);
+
+        let second = create(&mut h, &b, "Starts in accept edits", "", &b.todo);
+        h.settle().await;
+        let other = thread_of(&h, &second);
+        send(&mut h, &other, config("haiku", "acceptEdits"));
+        send(&mut h, &other, config("opus", "acceptEdits"));
+        assert_eq!((has_auto(&h, "haiku"), has_auto(&h, "opus")), (Some(false), None), "starting in accept edits is no fallback");
+        send(&mut h, &other, config("haiku", "auto"));
+        assert_eq!(has_auto(&h, "haiku"), Some(true));
+        assert_eq!(fallbacks(&h).len(), 1);
+
+        let saved: std::collections::BTreeMap<String, bool> = h.core.db.get_setting("autoMode.claude").unwrap();
+        assert_eq!(saved, [("haiku".to_owned(), true)].into());
+        assert_eq!(h.core.snapshot().auto_modes.get(crate::model::AgentId::Claude, "haiku"), Some(true));
+    }
+
     #[tokio::test]
     async fn a_task_thread_shares_the_projects_cargo_target_and_a_composer_thread_does_not() {
         let mut h = real_git();
@@ -523,6 +629,37 @@ mod tests {
         let env_of = |cwd: &str| spawned.iter().find(|s| s.cwd == cwd).unwrap().env.get("CARGO_TARGET_DIR").cloned();
         assert_eq!(env_of(&worktree), Some(Some(repo.join("target").to_string_lossy().into_owned())));
         assert_eq!(env_of(repo.to_str().unwrap()), None);
+    }
+
+    #[tokio::test]
+    async fn cleans_the_shared_build_folder_only_while_no_agent_of_the_project_works() {
+        let mut h = real_git();
+        let repo = h.dir.path().join("app");
+        init_repo(&repo);
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "").unwrap();
+        std::fs::create_dir_all(repo.join("target/debug")).unwrap();
+        std::fs::write(repo.join("target/debug/out"), "x").unwrap();
+        let b = board(&mut h, &repo);
+        let id = create(&mut h, &b, "Build it", "", &b.todo);
+        h.settle().await;
+        let thread = thread_of(&h, &id);
+        async fn clean(h: &mut Harness, project: &str) -> Result<(), String> {
+            let cleaning = tokio::spawn(h.core.me.clean_build(project.to_owned()));
+            h.settle().await;
+            cleaning.await.unwrap()
+        }
+        let refused = Err("APP-1's agent is working; clean once it stops".to_owned());
+        assert_eq!(clean(&mut h, &b.project).await, refused);
+        turn_end(&mut h, &thread, "end_turn");
+        assert!(matches!(run(&h, &id), Some(TaskRun::Finished(_))));
+        h.core.dispatch(ThreadEvent { thread_id: thread.clone(), body: ThreadEventBody::Status(ThreadStatus::Running { started_at: 1 }) });
+        assert_eq!(clean(&mut h, &b.project).await, refused, "a finished task's thread the user prompted builds too");
+        assert!(repo.join("target/debug/out").exists());
+        h.core.dispatch(ThreadEvent { thread_id: thread, body: ThreadEventBody::Status(ThreadStatus::Idle) });
+        assert_eq!(clean(&mut h, &b.project).await, Ok(()));
+        assert!(!repo.join("target").exists());
     }
 
     #[tokio::test]
@@ -555,6 +692,7 @@ mod tests {
         let (id, thread, worktree) = into_review(&mut h, &b, "Ship it").await;
         let parked = review(&h, &id);
         assert_eq!((parked.worktree.as_deref(), parked.pr.state), (None, PrState::Open));
+        assert_eq!(task(&h, &id).status_id, b.in_review, "an open pull request moves the task to In review");
         assert!(!worktree.exists(), "a clean worktree is removed while the pull request waits");
         assert!(h.calls().contains(&Call::Dispose(worktree.to_string_lossy().into_owned())));
         assert_eq!(git(&repo, &["branch", "--list", &parked.branch]), format!("{}", parked.branch));
@@ -585,6 +723,72 @@ mod tests {
         h.core.check_pull_requests();
         h.settle().await;
         assert_eq!(review(&h, &id).conflict_fix, ConflictFix::Clear);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_in_a_parked_review_thread_brings_the_worktree_back_until_the_turn_ends() {
+        let mut h = real_git();
+        let repo = h.dir.path().join("app");
+        init_repo(&repo);
+        let b = board(&mut h, &repo);
+        let (id, thread, worktree) = into_review(&mut h, &b, "Ship it").await;
+        assert!(!worktree.exists());
+        let control = |id: &str, value: &str| ConfigControl {
+            id: id.into(),
+            label: id.into(),
+            category: None,
+            source: ConfigSource::ConfigOption,
+            value: value.into(),
+            options: vec![ConfigChoice { value: value.into(), label: value.into(), description: None }],
+        };
+        h.core.dispatch(ThreadEvent { thread_id: thread.clone(), body: ThreadEventBody::Config(vec![control("mode", "auto"), control("model", "sonnet")]) });
+        h.core.prompt_thread(&thread, "Rename the flag".into()).unwrap();
+        h.settle().await;
+        let respawned = h.spawned.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            respawned.initial_config,
+            [("model".to_owned(), "sonnet".to_owned()), ("mode".to_owned(), "auto".to_owned())],
+            "a re-created session keeps the thread's model, with the mode last"
+        );
+        assert!(worktree.exists(), "the worktree comes back at the same path");
+        assert_eq!(review(&h, &id).worktree.as_deref(), Some(worktree.to_str().unwrap()));
+        let asked = Call::Prompt(worktree.to_string_lossy().into_owned(), "Rename the flag".into());
+        assert!(h.calls().contains(&asked), "{:?}", h.calls());
+        turn_end(&mut h, &thread, "end_turn");
+        h.settle().await;
+        assert!(!worktree.exists(), "parked again once the turn ends");
+        assert_eq!(review(&h, &id).worktree, None);
+    }
+
+    #[tokio::test]
+    async fn a_worktree_that_cannot_come_back_is_reported_in_the_thread_and_the_prompt_is_not_sent() {
+        let mut h = real_git();
+        let repo = h.dir.path().join("app");
+        init_repo(&repo);
+        let b = board(&mut h, &repo);
+        let (_, thread, worktree) = into_review(&mut h, &b, "Ship it").await;
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("stray.txt"), "not a worktree").unwrap();
+        h.core.prompt_thread(&thread, "Rename the flag".into()).unwrap();
+        h.settle().await;
+        assert!(!prompts(&h).iter().any(|p| p == "Rename the flag"));
+        let notice = h.core.threads[&thread].timeline.iter().find_map(|item| match item {
+            crate::model::TimelineItem::Notice { level: crate::model::NoticeLevel::Error, text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        assert!(notice.as_deref().is_some_and(|t| t.contains("is not a worktree")), "{notice:?}");
+    }
+
+    #[tokio::test]
+    async fn stays_in_progress_on_a_board_without_a_review_status() {
+        let mut h = real_git();
+        let repo = h.dir.path().join("app");
+        init_repo(&repo);
+        let b = board(&mut h, &repo);
+        h.core.tasks.remove_status(&b.in_review).unwrap();
+        let (id, _, _) = into_review(&mut h, &b, "Ship it").await;
+        assert_eq!(task(&h, &id).status_id, b.in_progress);
+        assert!(matches!(run(&h, &id), Some(TaskRun::Review(_))));
     }
 
     #[tokio::test]

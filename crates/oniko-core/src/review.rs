@@ -8,7 +8,8 @@ use serde::Deserialize;
 
 use crate::core::Core;
 use crate::model::{
-    ConflictFix, Mergeable, Merged, PrState, PullRequest, Review, ReviewAction, RunInfo, StatusKind, Task, TaskRun,
+    ConflictFix, Mergeable, Merged, NoticeLevel, PrState, PullRequest, Review, ReviewAction, RunInfo, StatusKind, Task, TaskRun,
+    ThreadEvent, ThreadEventBody,
 };
 use crate::runner::{argv, conflict_prompt, fetch_base, worktree_for, worktree_path};
 
@@ -97,14 +98,42 @@ impl Core {
         };
         let review = Review { thread_id: info.thread_id, branch: info.branch, worktree: Some(info.worktree), pr, conflict_fix: ConflictFix::Clear };
         self.set_run(id, Some(TaskRun::Review(review.clone())));
+        self.move_to_first(id, StatusKind::Review);
         self.notify_task(&review.thread_id, format!("{key}: pull request opened"), review.pr.url.clone());
         self.park(&task.project, id, &review);
         self.ensure_polling();
     }
 
+    /// A prompt the user sends from a thread. A task under review may have its worktree parked, or on
+    /// its way out, so the folder is brought back first under the git lock; the turn's end parks it again.
+    pub(crate) fn prompt_thread(&mut self, thread_id: &str, text: String) -> Result<(), String> {
+        let Some(task) = self.tasks.state().task_for_thread(thread_id).cloned() else { return self.session(thread_id).map(|s| s.prompt(text)) };
+        let Some(TaskRun::Review(review)) = &task.run else { return self.session(thread_id).map(|s| s.prompt(text)) };
+        let path = worktree_path(&self.worktree_root, &task.project, &review.branch);
+        let work = worktree_for(self.git.clone(), task.project.clone(), path, review.branch.clone());
+        let (id, thread_id) = (task.id.clone(), thread_id.to_owned());
+        self.with_git_lock(&task.project, work, move |core, result| core.restored_for_prompt(&id, &thread_id, text, result));
+        Ok(())
+    }
+
+    fn restored_for_prompt(&mut self, id: &str, thread_id: &str, text: String, result: Result<String, String>) {
+        match result {
+            Ok(worktree) => {
+                self.update_review(id, |r| r.worktree = Some(worktree));
+                if let Ok(session) = self.session(thread_id) {
+                    session.prompt(text);
+                }
+            }
+            Err(error) => {
+                let body = ThreadEventBody::Notice { level: NoticeLevel::Error, text: format!("Could not bring back the worktree: {error}") };
+                self.dispatch(ThreadEvent { thread_id: thread_id.to_owned(), body });
+            }
+        }
+    }
+
     /// While the pull request waits its folder is not needed: a clean worktree is removed, the branch
     /// stays. The agent is stopped first so no process sits in a deleted folder.
-    fn park(&mut self, project: &str, id: &str, review: &Review) {
+    pub(crate) fn park(&mut self, project: &str, id: &str, review: &Review) {
         let Some(worktree) = review.worktree.clone() else { return };
         let stopped = self.dispose_session(&review.thread_id);
         let (git, repo, id) = (self.git.clone(), project.to_owned(), id.to_owned());
@@ -241,12 +270,7 @@ impl Core {
     fn merged(&mut self, task: &Task, review: Review) {
         let merged = Merged { thread_id: review.thread_id, branch: review.branch, pr: review.pr };
         self.set_run(&task.id, Some(TaskRun::Merged(merged.clone())));
-        let done = self.tasks.state().project_statuses(&task.project).into_iter().find(|s| s.kind == StatusKind::Completed).map(|s| s.id.clone());
-        if let Some(done) = done
-            && let Ok((true, _)) = self.tasks.move_task(&task.id, &done, None)
-        {
-            self.publish_tasks();
-        }
+        self.move_to_first(&task.id, StatusKind::Completed);
         self.notify_task(&merged.thread_id, format!("{}: pull request merged", task.key()), task.title.clone());
         self.clean_merged(&task.project, &merged);
     }

@@ -1,3 +1,4 @@
+use super::agents::AutoModes;
 use super::subscriptions::SubscriptionsState;
 use super::tasks::TasksState;
 use super::thread::{ConfigControl, NoticeLevel, PermissionOutcome, Thread, ThreadId, ThreadStatus};
@@ -30,6 +31,7 @@ pub enum AppEvent {
     Thread(ThreadEvent),
     Subscriptions(SubscriptionsState),
     Tasks(TasksState),
+    AutoModes(AutoModes),
     /// A clicked notification asks the UI to show this thread.
     OpenThread(ThreadId),
 }
@@ -49,4 +51,5 @@ pub struct AppSnapshot {
     pub threads: Vec<Thread>,
     pub subscriptions: SubscriptionsState,
     pub tasks: TasksState,
+    pub auto_modes: AutoModes,
 }

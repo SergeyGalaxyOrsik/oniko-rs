@@ -2,7 +2,7 @@
 //! and results of background work (agent events, git, login probes) arrive as jobs and run one at a
 //! time, so no state is ever shared or locked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -12,10 +12,11 @@ use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::build::{target_dir, target_size};
 use crate::db::Db;
 use crate::model::reducer::{Outcome, ThreadMap, reduce_threads};
 use crate::model::{
-    AgentId, AppEvent, AppSnapshot, SequencedEvent, StatusKind, Subscription, SubscriptionId, TaskId, TaskStatusId, Thread,
+    AgentId, AppEvent, AppSnapshot, AutoModes, SequencedEvent, StatusKind, Subscription, SubscriptionId, TaskId, TaskStatusId, Thread,
     ThreadEvent, ThreadEventBody, ThreadId, ThreadStatus,
 };
 use crate::registry::{AccountSpecs, account_specs, base_env};
@@ -160,7 +161,7 @@ impl CoreHandle {
     }
 
     pub fn prompt(&self, id: ThreadId, text: String) -> impl Future<Output = Result<(), String>> + use<> {
-        self.command("threads:prompt", move |core| core.session(&id).map(|s| s.prompt(text)))
+        self.command("threads:prompt", move |core| core.prompt_thread(&id, text))
     }
 
     pub fn cancel(&self, id: ThreadId) -> impl Future<Output = Result<(), String>> + use<> {
@@ -168,7 +169,11 @@ impl CoreHandle {
     }
 
     pub fn set_config(&self, id: ThreadId, config_id: String, value: String) -> impl Future<Output = Result<(), String>> + use<> {
-        self.command("threads:setConfig", move |core| core.session(&id).map(|s| s.set_config(config_id, value)))
+        self.command("threads:setConfig", move |core| {
+            // A mode the user picks is no verdict on the model.
+            core.auto_mode_watch.remove(&id);
+            core.session(&id).map(|s| s.set_config(config_id, value))
+        })
     }
 
     /// `None` declines.
@@ -317,6 +322,28 @@ impl CoreHandle {
         })
     }
 
+    /// The bytes in the project's shared Cargo build folder, walked off the core thread; None when the
+    /// project is not a Cargo project.
+    pub fn build_folder_size(&self, project: String) -> impl Future<Output = Result<Option<u64>, String>> + use<> {
+        let walk = self.runtime.spawn_blocking(move || target_size(&project));
+        async move { walk.await.map_err(|e| e.to_string()) }
+    }
+
+    /// Runs `cargo clean` in the project, unless an agent of one of its tasks may be building.
+    pub fn clean_build(&self, project: String) -> impl Future<Output = Result<(), String>> + use<> {
+        let check = project.clone();
+        let allowed = self.command("tasks:cleanBuild", move |core| match core.tasks.state().clean_build_blocker(&check, &core.threads) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        });
+        let me = self.clone();
+        async move {
+            allowed.await?;
+            let cargo = system_cli("cargo");
+            me.on_runtime(cargo(project, vec!["clean".into()])).await.ok_or(STOPPED.to_owned())?.map(|_| ())
+        }
+    }
+
     pub fn recent_folders(&self) -> impl Future<Output = Result<Vec<String>, String>> + use<> {
         self.command("folders:recent", |core| Ok(core.recent_folders()))
     }
@@ -366,6 +393,10 @@ fn err(error: anyhow::Error) -> String {
 }
 
 const RECENT_KEY: &str = "recentFolders";
+
+pub(crate) fn auto_mode_key(agent: AgentId) -> String {
+    format!("autoMode.{}", agent.as_str())
+}
 const RECENT_LIMIT: usize = 8;
 
 pub struct CoreDeps {
@@ -403,6 +434,9 @@ pub struct Core {
     pub(crate) notify: Notify,
     session_factory: SessionFactory,
     pub(crate) telemetry: Telemetry,
+    pub(crate) auto_modes: AutoModes,
+    /// Task threads asked to run in auto mode whose config has not yet told whether the model has it.
+    pub(crate) auto_mode_watch: HashSet<ThreadId>,
 }
 
 impl Core {
@@ -415,6 +449,10 @@ impl Core {
             threads.insert(restored.id.clone(), restored);
         }
         let tasks = TaskStore::new(deps.db.clone())?;
+        let mut auto_modes = AutoModes::default();
+        for agent in AgentId::ALL {
+            auto_modes.set(agent, deps.db.get_setting(&auto_mode_key(agent)).unwrap_or_default());
+        }
         let mut core = Core {
             db: deps.db,
             seq: 0,
@@ -433,6 +471,8 @@ impl Core {
             notify: deps.notify,
             session_factory: deps.sessions,
             telemetry: deps.telemetry,
+            auto_modes,
+            auto_mode_watch: HashSet::new(),
         };
         core.fail_interrupted_starts();
         core.resume_reviews();
@@ -447,6 +487,7 @@ impl Core {
             threads: self.thread_list().into_iter().cloned().collect(),
             subscriptions: self.subscriptions.state(),
             tasks: self.tasks.state().clone(),
+            auto_modes: self.auto_modes.clone(),
         }
     }
 
@@ -501,6 +542,7 @@ impl Core {
 
     /// Every thread change goes through here: reduced, written through to the db, then broadcast.
     pub(crate) fn dispatch(&mut self, event: ThreadEvent) {
+        let mode_before = self.auto_mode_watch.contains(&event.thread_id).then(|| self.mode_of(&event.thread_id));
         let outcome = reduce_threads(&mut self.threads, &event);
         let saved = match &outcome {
             Outcome::Unchanged => Ok(()),
@@ -516,6 +558,9 @@ impl Core {
         }
         self.publish(AppEvent::Thread(event.clone()));
         self.on_task_thread_event(&event);
+        if let Some(mode_before) = mode_before {
+            self.watch_auto_mode(&event, mode_before);
+        }
     }
 
     pub(crate) fn count_using(&self, subscription_id: &str) -> usize {
@@ -566,9 +611,17 @@ impl Core {
             let subscription = self.subscriptions.get(&thread.subscription_id).ok_or("This thread’s subscription was removed")?;
             let mut env = self.subscriptions.specs().get(&subscription.agent_id).map(|spec| spec.env_for(&subscription.config_dir)).unwrap_or_default();
             if let Some(task) = self.tasks.state().task_for_thread(id) {
-                let target = std::path::Path::new(&task.project).join("target");
-                env.insert("CARGO_TARGET_DIR".into(), Some(target.to_string_lossy().into_owned()));
+                env.insert("CARGO_TARGET_DIR".into(), Some(target_dir(&task.project).to_string_lossy().into_owned()));
             }
+            // The agent resumes a session on its default model, so a re-created session (after parking,
+            // a restart or a crash) gets the thread's last values back. Mode goes last: the adapter
+            // judges a mode against the model already set.
+            let initial_config = if initial_config.is_empty() {
+                let (modes, rest): (Vec<_>, Vec<_>) = thread.config.iter().map(|c| (c.id.clone(), c.value.clone())).partition(|(id, _)| id == "mode");
+                rest.into_iter().chain(modes).collect()
+            } else {
+                initial_config
+            };
             let me = self.me.clone();
             let thread_id = id.to_owned();
             let emit: Emit = Arc::new(move |body| {

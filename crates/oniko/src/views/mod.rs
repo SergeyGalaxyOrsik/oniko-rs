@@ -92,6 +92,21 @@ pub fn short_date(at_ms: i64) -> String {
     format!("{} {day}", MONTHS[(month - 1) as usize])
 }
 
+/// "4.2 GB", in the decimal units Finder uses.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1000.;
+    let mut unit = 0;
+    while value >= 999.95 && unit < UNITS.len() - 1 {
+        value /= 1000.;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 pub fn account_label(account: &AccountStatus) -> &'static str {
     match account {
         AccountStatus::Unknown => "Not checked",
@@ -189,7 +204,7 @@ fn pr_link(id: &str, pr: &PullRequest, label: String, cx: &App) -> AnyElement {
 }
 
 /// Linear's workflow icons: a dashed ring for backlog, an empty ring before work starts, a ring with a
-/// dot as work moves along, a filled check when done and a filled cross when canceled.
+/// dot as work moves along, a filled eye in review, a filled check when done and a filled cross when canceled.
 pub fn status_icon(status: &TaskStatus, cx: &App) -> impl IntoElement {
     let t = theme(cx);
     let color = t.status(status.color);
@@ -208,16 +223,23 @@ pub fn status_icon(status: &TaskStatus, cx: &App) -> impl IntoElement {
             .justify_center()
             .child(div().size(px(6.)).rounded_full().bg(color))
             .into_any_element(),
-        StatusKind::Completed | StatusKind::Canceled => div()
-            .size(size)
-            .flex_none()
-            .rounded_full()
-            .bg(color)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(icon(if status.kind == StatusKind::Completed { Icon::Check } else { Icon::X }, t.background).size(px(10.)))
-            .into_any_element(),
+        StatusKind::Review | StatusKind::Completed | StatusKind::Canceled => {
+            let glyph = match status.kind {
+                StatusKind::Review => Icon::Eye,
+                StatusKind::Completed => Icon::Check,
+                _ => Icon::X,
+            };
+            div()
+                .size(size)
+                .flex_none()
+                .rounded_full()
+                .bg(color)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(glyph, t.background).size(px(10.)))
+                .into_any_element()
+        }
     }
 }
 
@@ -238,5 +260,10 @@ mod tests {
         assert_eq!(shorten_home("/Users/ab", "/Users/a"), "/Users/ab");
         assert_eq!(short_date(1_793_791_240_865), "Nov 4");
         assert_eq!(short_date(0), "Jan 1");
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1_000), "1.0 KB");
+        assert_eq!(format_bytes(4_230_000_000), "4.2 GB");
+        assert_eq!(format_bytes(999_960), "1.0 MB");
     }
 }
