@@ -18,7 +18,8 @@ Each project has a board of tasks. A task waits in a "Not started" status until 
 
 - Each started task gets its own git worktree and branch, created from a fresh `origin/HEAD`. Oniko never checks out or pulls in the project folder itself, and runs its own git commands for one project one at a time.
 - A task can pin the model its agent runs on. If the agent does not offer that model, the start fails instead of falling back.
-- With a pull request, the agent rebases on the base branch, pushes and runs `gh pr create`. Oniko then reads the pull request's state from GitHub with `gh pr list`, once a minute, while any is open.
+- Task agents run in Claude's auto permission mode, so nobody approves each command. On a model without auto mode the adapter falls back to accepting edits and asks for the rest.
+- With a pull request, the agent rebases on the base branch, pushes and runs `gh pr create`. Oniko then reads the pull request's state from GitHub with `gh pr list`, every 30 seconds, while any is open. Run plan turns on the pull request of every task it queues.
 - While a pull request waits, its clean worktree is removed and the branch kept. On a conflict, Oniko restores the worktree and asks the agent to fix it once, then tells you.
 - On merge, the task moves to Done, its worktree and local branch are deleted, and the tasks waiting on it start from the new base.
 - Every task agent gets `CARGO_TARGET_DIR=<project>/target`, so all worktrees of a Rust project share one build folder instead of each growing its own. Parallel builds wait for Cargo's lock on it.

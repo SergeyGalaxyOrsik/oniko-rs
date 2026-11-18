@@ -678,7 +678,9 @@ impl Core {
         let backlog: Vec<String> = statuses.iter().filter(|s| s.kind == StatusKind::Backlog).map(|s| s.id.clone()).collect();
         let drafts: Vec<String> =
             self.tasks.state().project_tasks(project).into_iter().filter(|t| backlog.contains(&t.status_id)).map(|t| t.id.clone()).collect();
+        // A plan's work lands through pull requests, the last task of a chain included.
         for id in drafts {
+            self.tasks.update(&id, TaskPatch { pull_request: Some(true), ..Default::default() }).map_err(err)?;
             if let (_, Some(entered)) = self.tasks.move_task(&id, &queue, None).map_err(err)? {
                 self.task_entered(entered);
             }

@@ -10,6 +10,10 @@ use crate::model::{ConflictFix, RunInfo, StatusKind, Subscription, Task, TaskRun
 use crate::stores::tasks::Entered;
 use crate::util::{basename, resolve};
 
+/// The Claude adapter's permission mode where a classifier approves commands instead of the user.
+/// On a model without auto mode the adapter falls back to accepting edits and asks for the rest.
+const TASK_MODE: (&str, &str) = ("mode", "auto");
+
 pub fn task_prompt(task: &Task, branch: &str) -> String {
     [
         format!("{}: {}", task.key(), task.title),
@@ -149,21 +153,26 @@ impl Core {
         self.with_git_lock(&task.project, work, move |core, result| core.worktree_ready(&id, &subscription.id, branch, config, result));
     }
 
-    /// The agent's last known values with the task's model in place. A model the agent is known not to
-    /// offer fails the run: the session would silently keep another one.
+    /// The agent's last known values with the task's model in place, in auto mode so nobody has to approve
+    /// each command. A model the agent is known not to offer fails the run: the session would silently
+    /// keep another one.
     fn initial_config(&self, task: &Task, subscription: &Subscription) -> Result<Vec<(String, String)>, String> {
         let known = new_thread_config(self.threads.values(), subscription.agent_id, &subscription.id);
-        let mut config: Vec<(String, String)> = known.iter().map(|c| (c.id.clone(), c.value.clone())).collect();
-        let Some(model) = &task.model else { return Ok(config) };
-        if let Some(control) = known.iter().find(|c| c.id == "model")
-            && !control.options.iter().any(|o| o.value == *model)
-        {
-            return Err(format!("The agent does not offer the model {model}"));
+        let mut config: Vec<(String, String)> = known.iter().filter(|c| c.id != TASK_MODE.0).map(|c| (c.id.clone(), c.value.clone())).collect();
+        if let Some(model) = &task.model {
+            if let Some(control) = known.iter().find(|c| c.id == "model")
+                && !control.options.iter().any(|o| o.value == *model)
+            {
+                return Err(format!("The agent does not offer the model {model}"));
+            }
+            match config.iter_mut().find(|(id, _)| id == "model") {
+                Some(entry) => entry.1 = model.clone(),
+                None => config.push(("model".into(), model.clone())),
+            }
         }
-        match config.iter_mut().find(|(id, _)| id == "model") {
-            Some(entry) => entry.1 = model.clone(),
-            None => config.push(("model".into(), model.clone())),
-        }
+        // Last, because the session applies these in order and the adapter drops auto mode for a model
+        // that does not support it; set after the model, the adapter judges it against the final one.
+        config.push((TASK_MODE.0.into(), TASK_MODE.1.into()));
         Ok(config)
     }
 
@@ -497,7 +506,7 @@ mod tests {
         assert!(!h.dir.path().join("worktrees/app/app-1-too-fancy").exists());
         let worktree = run(&h, &offered).unwrap().worktree().unwrap().to_owned();
         let spawned = h.spawned.lock().unwrap().iter().find(|s| s.cwd == worktree).cloned().unwrap();
-        assert_eq!(spawned.initial_config, [("model".to_owned(), "opus".to_owned())]);
+        assert_eq!(spawned.initial_config, [("model".to_owned(), "opus".to_owned()), ("mode".to_owned(), "auto".to_owned())]);
     }
 
     #[tokio::test]
@@ -622,6 +631,7 @@ mod tests {
         assert!(matches!(run(&h, &a), Some(TaskRun::Working(_))));
         assert_eq!(run(&h, &next), None);
         assert_eq!(h.core.tasks.state().waiting_reason(&task(&h, &next)).as_deref(), Some("Waiting for APP-1"));
+        assert!(task(&h, &next).pull_request, "the last task of a plan opens a pull request too");
 
         let thread = thread_of(&h, &a);
         let branch = run(&h, &a).unwrap().branch().unwrap().to_owned();
