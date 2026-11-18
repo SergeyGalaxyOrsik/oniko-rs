@@ -3,16 +3,17 @@
 use std::time::Duration;
 
 use gpui::{AnyElement, App, AsyncApp, Context, Corner, Entity, EventEmitter, FontWeight, IntoElement, SharedString, Task as GpuiTask, WeakEntity, Window, div, prelude::*, px};
-use oniko_core::model::{StatusKind, Task, TaskId, TaskRun, TaskStatus, ThreadStatus};
+use oniko_core::model::config::new_thread_config;
+use oniko_core::model::{ConfigChoice, StatusKind, Task, TaskId, TaskRun, TaskStatus, ThreadStatus};
 use oniko_core::stores::tasks::TaskPatch;
 
 use crate::icons::{Icon, icon};
 use crate::state::{run, store};
 use crate::theme::theme;
 use crate::ui::text_field::{EnterKey, TextField, TextFieldEvent};
-use crate::ui::{MenuEntry, Variant, button, dropdown, item};
+use crate::ui::{ButtonSize, MenuEntry, Variant, button, dropdown, icon_button, item};
 use crate::views::tasks::status_menu;
-use crate::views::{Nav, account_color, ago, shorten_home, status_icon};
+use crate::views::{Nav, Progress, account_color, ago, shorten_home, status_icon};
 
 const AUTOSAVE: Duration = Duration::from_millis(600);
 
@@ -163,14 +164,179 @@ impl TaskPage {
         )
     }
 
+    /// The model the agent starts on. The choices are the ones the agent offered on its newest thread.
+    fn model_property(&self, task: &Task, cx: &mut Context<Self>) -> AnyElement {
+        let t = theme(cx);
+        let state = &store(cx).read(cx).state;
+        let thread = task.thread_id().and_then(|id| state.threads.get(id));
+        let subscription = thread
+            .and_then(|th| state.subscriptions.get(&th.subscription_id))
+            .or_else(|| task.subscription_id.as_deref().and_then(|id| state.subscriptions.get(id)))
+            .or_else(|| state.subscriptions.active());
+        let choices: Option<Vec<ConfigChoice>> = subscription
+            .map(|s| new_thread_config(state.threads.values(), s.agent_id, &s.id))
+            .and_then(|config| config.into_iter().find(|c| c.id == "model"))
+            .map(|c| c.options);
+        let name = |value: &str| choices.iter().flatten().find(|o| o.value == value).map_or(value.to_owned(), |o| o.label.clone());
+        let shown = match thread.and_then(|th| th.config.iter().find(|c| c.id == "model")) {
+            Some(control) => control.options.iter().find(|o| o.value == control.value).map_or(control.value.clone(), |o| o.label.clone()),
+            None => task.model.as_deref().map_or("Last used".to_owned(), name),
+        };
+        let label = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(30.))
+            .px_2()
+            .rounded_md()
+            .text_sm()
+            .child(icon(Icon::Brain, t.muted_foreground))
+            .child(div().truncate().child(shown));
+        if thread.is_some() {
+            return div()
+                .id("task-model")
+                .child(label.child(icon(Icon::Lock, t.muted_foreground).size(px(12.))))
+                .tooltip(|_, cx| crate::ui::tooltip_view("The agent stays on the model it started with".into(), cx))
+                .into_any_element();
+        }
+        let current = task.model.clone();
+        let task_id = task.id.clone();
+        dropdown(
+            "task-model",
+            crate::ui::is_open(&self.open_menu, "model"),
+            Corner::TopLeft,
+            label.hover(|s| s.bg(t.accent)).child(icon(Icon::ChevronDown, t.muted_foreground).size(px(12.))),
+            move || {
+                let set = move |model: Option<String>| {
+                    let task_id = task_id.clone();
+                    move |_: &mut Window, cx: &mut App| run(cx, |c| c.update_task(task_id.clone(), TaskPatch { model: Some(model.clone()), ..Default::default() }))
+                };
+                let mut rows = vec![item("Last used", set(None)).detail("The model of the agent's last thread").checked(current.is_none()).entry()];
+                match choices {
+                    Some(choices) => {
+                        rows.push(MenuEntry::Separator);
+                        rows.extend(choices.into_iter().map(|o| {
+                            let checked = current.as_ref() == Some(&o.value);
+                            item(o.label, set(Some(o.value))).checked(checked).entry()
+                        }));
+                    }
+                    None => rows.push(item("Models appear after the agent has run once", |_, _| {}).disabled(true).entry()),
+                }
+                rows
+            },
+            self.menu_setter("model", cx),
+            cx,
+        )
+    }
+
+    /// One linked task; a click opens it, and `remove` drops the link.
+    fn linked_task(&self, other: &Task, remove: Option<TaskId>, cx: &mut Context<Self>) -> AnyElement {
+        let t = theme(cx);
+        let status = store(cx).read(cx).state.tasks.status(&other.status_id).cloned();
+        let open = other.id.clone();
+        let project = self.project.clone();
+        let task_id = self.task_id.clone();
+        div()
+            .id(SharedString::from(format!("linked-{}", other.id)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(30.))
+            .pl_2()
+            .pr_0p5()
+            .rounded_md()
+            .text_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(t.accent))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(Nav::OpenTasks { project: project.clone(), task: Some(open.clone()) })))
+            .children(status.map(|s| status_icon(&s, cx).into_any_element()))
+            .child(div().flex_none().text_xs().text_color(t.muted_foreground).child(other.key()))
+            .child(div().flex_1().min_w_0().truncate().child(other.title.clone()))
+            .children(remove.map(|blocker| {
+                icon_button(SharedString::from(format!("unlink-{blocker}")), Icon::X)
+                    .muted()
+                    .size(ButtonSize::Icon)
+                    .tooltip("Stop waiting for this task")
+                    .on_click(move |_, _, cx| run(cx, |c| c.remove_dependency(task_id.clone(), blocker.clone())))
+            }))
+            .into_any_element()
+    }
+
+    /// The tasks this one waits for, and a menu of the ones it could wait for without a cycle.
+    fn blocked_by_property(&self, task: &Task, cx: &mut Context<Self>) -> AnyElement {
+        let tasks = store(cx).read(cx).state.tasks.clone();
+        let blockers: Vec<Task> = task.blocked_by.iter().filter_map(|id| tasks.task(id)).cloned().collect();
+        let candidates: Vec<(Task, Option<TaskStatus>)> = tasks
+            .project_tasks(&self.project)
+            .into_iter()
+            .filter(|other| other.id != task.id && !task.blocked_by.contains(&other.id) && !tasks.depends_on(&other.id, &task.id))
+            .map(|other| (other.clone(), tasks.status(&other.status_id).cloned()))
+            .collect();
+        let t = theme(cx);
+        let task_id = task.id.clone();
+        let add = dropdown(
+            "task-add-blocker",
+            crate::ui::is_open(&self.open_menu, "blocker"),
+            Corner::TopLeft,
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .h(px(30.))
+                .px_2()
+                .rounded_md()
+                .text_sm()
+                .text_color(t.muted_foreground)
+                .hover(|s| s.bg(t.accent).text_color(t.foreground))
+                .child(icon(Icon::Plus, t.muted_foreground).size(px(14.)))
+                .child("Add a task to wait for"),
+            move || {
+                if candidates.is_empty() {
+                    return vec![item("No other task can come first", |_, _| {}).disabled(true).entry()];
+                }
+                candidates
+                    .into_iter()
+                    .map(|(other, status)| {
+                        let (task_id, blocker) = (task_id.clone(), other.id.clone());
+                        let row = item(format!("{} {}", other.key(), other.title), move |_, cx| run(cx, |c| c.add_dependency(task_id.clone(), blocker.clone())));
+                        match status {
+                            Some(status) => row.dot(t.status(status.color)).detail(status.name),
+                            None => row,
+                        }
+                        .entry()
+                    })
+                    .collect()
+            },
+            self.menu_setter("blocker", cx),
+            cx,
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .children(blockers.iter().map(|b| self.linked_task(b, Some(b.id.clone()), cx)).collect::<Vec<_>>())
+            .child(add)
+            .into_any_element()
+    }
+
     /// Where the task's agent is: how to start it, what went wrong, or its thread, branch and worktree.
     fn agent_property(&self, task: &Task, statuses: &[TaskStatus], cx: &mut Context<Self>) -> AnyElement {
         let t = theme(cx);
         let home = store(cx).read(cx).home.clone();
         let hint = |text: String| div().px_2().text_xs().text_color(t.muted_foreground).line_height(px(18.)).child(text).into_any_element();
         let queue = statuses.iter().find(|s| s.kind == StatusKind::Unstarted).map_or("a Not started status".to_owned(), |s| s.name.clone());
+        let waiting = store(cx).read(cx).state.tasks.waiting_reason(task);
         match &task.run {
-            None => hint(format!("Move the task to {queue} to start an agent on it in its own worktree.")),
+            None => match waiting {
+                Some(reason) => div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().px_2().text_sm().child(reason))
+                    .child(hint(format!("It starts in {queue} once every task it waits for is done.")))
+                    .into_any_element(),
+                None => hint(format!("Move the task to {queue} to start an agent on it in its own worktree.")),
+            },
             Some(TaskRun::Starting) => div()
                 .flex()
                 .items_center()
@@ -193,6 +359,10 @@ impl TaskPage {
             Some(run) => {
                 let (Some(thread_id), Some(branch)) = (run.thread_id().cloned(), run.branch().map(str::to_owned)) else { return div().into_any_element() };
                 let worktree = run.worktree().map(str::to_owned);
+                let pull_request = match Progress::of(task, &store(cx).read(cx).state.tasks) {
+                    Some(progress @ (Progress::Review(_) | Progress::Merged(_))) => Some(div().px_2().child(progress.render("task-page", cx))),
+                    _ => None,
+                };
                 let status = store(cx).read(cx).state.threads.get(&thread_id).map(|th| th.status.clone());
                 let stage = match (&status, run) {
                     (Some(ThreadStatus::AwaitingPermission { .. }), _) => "Needs your approval",
@@ -213,6 +383,7 @@ impl TaskPage {
                             .full_width()
                             .on_click(cx.listener(move |_, _, _, cx| cx.emit(Nav::OpenThread(thread_id.clone())))),
                     )
+                    .children(pull_request)
                     .child(
                         div()
                             .flex()
@@ -282,7 +453,8 @@ impl Render for TaskPage {
                 cx,
             )
         });
-        let pull_request_locked = matches!(task.run, Some(TaskRun::PullRequest(_) | TaskRun::Finished(_) | TaskRun::Review(_) | TaskRun::Merged(_)));
+        let dependents: Vec<Task> = store(cx).read(cx).state.tasks.dependents(&task.id).into_iter().cloned().collect();
+        let pull_request_locked = !dependents.is_empty() || matches!(task.run, Some(TaskRun::PullRequest(_) | TaskRun::Finished(_) | TaskRun::Review(_) | TaskRun::Merged(_)));
         let toggle_id = task_id.clone();
         let pull_request = task.pull_request;
         let delete_id = task_id.clone();
@@ -359,6 +531,7 @@ impl Render for TaskPage {
                                     .gap_0p5()
                                     .children(status_picker)
                                     .child(self.subscription_property(&task, cx))
+                                    .child(self.model_property(&task, cx))
                                     .child(
                                         button("task-pull-request", "Open a pull request")
                                             .icon(Icon::GitPullRequest)
@@ -368,9 +541,24 @@ impl Render for TaskPage {
                                             .on_click(move |_, _, cx| {
                                                 run(cx, |c| c.update_task(toggle_id.clone(), TaskPatch { pull_request: Some(!pull_request), ..Default::default() }))
                                             }),
-                                    ),
+                                    )
+                                    .when(!dependents.is_empty(), |d| {
+                                        d.child(
+                                            div()
+                                                .px_2()
+                                                .text_xs()
+                                                .text_color(t.muted_foreground)
+                                                .line_height(px(18.))
+                                                .child("Always on: the tasks below wait for this pull request to be merged."),
+                                        )
+                                    }),
                                 cx,
                             ))
+                            .child(property("Blocked by", self.blocked_by_property(&task, cx), cx))
+                            .when(!dependents.is_empty(), |d| {
+                                let rows: Vec<AnyElement> = dependents.iter().map(|other| self.linked_task(other, None, cx)).collect();
+                                d.child(property("Blocks", div().flex().flex_col().gap_0p5().children(rows), cx))
+                            })
                             .child(property("Agent", self.agent_property(&task, &statuses, cx), cx))
                             .child(property("Task", div().px_2().text_sm().text_color(t.muted_foreground).child(task.key()), cx))
                             .child(
