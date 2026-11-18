@@ -5,17 +5,19 @@ mod plan;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use gpui::{AnyElement, App, Context, Corner, Entity, EventEmitter, FontWeight, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, App, AsyncApp, Context, Corner, Entity, EventEmitter, FontWeight, IntoElement, SharedString, WeakEntity, Window, div, prelude::*, px,
+};
 use oniko_core::model::{StatusKind, Task, TaskId, TaskStatus, TaskStatusId};
 use oniko_core::stores::tasks::StatusPatch;
 
 use crate::icons::{Icon, icon};
-use crate::state::{run, store};
+use crate::state::{core, run, store};
 use crate::theme::theme;
 use crate::ui::text_field::{TextField, TextFieldEvent};
 use crate::ui::{ButtonSize, MenuEntry, button, dropdown, field_frame, icon_button, item};
 use crate::views::task_page::TaskPage;
-use crate::views::{Nav, Progress, short_date, status_icon};
+use crate::views::{Nav, Progress, format_bytes, short_date, status_icon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Layout {
@@ -46,6 +48,9 @@ pub struct TasksView {
     adding_status: Option<Entity<TextField>>,
     open_menu: Option<SharedString>,
     page: Option<Entity<TaskPage>>,
+    /// The bytes in the project's shared Cargo build folder; None for a project that is not a Cargo project.
+    build_folder: Option<u64>,
+    cleaning: bool,
 }
 
 impl EventEmitter<Nav> for TasksView {}
@@ -65,7 +70,85 @@ impl TasksView {
         })
         .detach();
         run(cx, |c| c.open_project(project.clone()));
-        TasksView { project, layout: Layout::List, collapsed: HashSet::new(), renaming: None, adding_status: None, open_menu: None, page: None }
+        let mut view = TasksView {
+            project,
+            layout: Layout::List,
+            collapsed: HashSet::new(),
+            renaming: None,
+            adding_status: None,
+            open_menu: None,
+            page: None,
+            build_folder: None,
+            cleaning: false,
+        };
+        view.measure_build_folder(cx);
+        view
+    }
+
+    fn measure_build_folder(&mut self, cx: &mut Context<Self>) {
+        let size = core(cx).build_folder_size(self.project.clone());
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            if let Ok(size) = size.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.build_folder = size;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn clean_build(&mut self, cx: &mut Context<Self>) {
+        self.cleaning = true;
+        cx.notify();
+        let clean = core(cx).clean_build(self.project.clone());
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = clean.await;
+            let _ = this.update(cx, |this, cx| {
+                this.cleaning = false;
+                if let Err(error) = result {
+                    store(cx).update(cx, |store, cx| store.report(error, cx));
+                }
+                this.measure_build_folder(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The size of the build folder every task agent shares, and a menu to clean it.
+    fn build_folder_menu(&self, bytes: u64, cx: &mut Context<Self>) -> AnyElement {
+        let t = theme(cx);
+        let state = &store(cx).read(cx).state;
+        let blocker = state.tasks.clean_build_blocker(&self.project, &state.threads);
+        let cleaning = self.cleaning;
+        let entity = cx.entity();
+        let label = if cleaning { "Cleaning…".to_owned() } else { format!("target {}", format_bytes(bytes)) };
+        dropdown(
+            "build-folder",
+            crate::ui::is_open(&self.open_menu, "build-folder"),
+            Corner::TopRight,
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h(px(28.))
+                .px_2()
+                .rounded_md()
+                .text_xs()
+                .text_color(t.muted_foreground)
+                .hover(|s| s.bg(t.accent))
+                .child(icon(if cleaning { Icon::Loader } else { Icon::Folder }, t.muted_foreground).size(px(14.)))
+                .child(label),
+            move || {
+                let clean = item("Clean build", move |_, cx| entity.update(cx, |this, cx| this.clean_build(cx)))
+                    .icon(Icon::Trash)
+                    .disabled(cleaning || blocker.is_some())
+                    .detail(blocker.clone().unwrap_or_else(|| "Runs cargo clean in the project".into()));
+                vec![MenuEntry::Label("Shared Cargo build folder".into()), clean.entry()]
+            },
+            self.menu_setter("build-folder".into(), cx),
+            cx,
+        )
     }
 
     pub fn open_task(&mut self, task: Option<TaskId>, window: &mut Window, cx: &mut Context<Self>) {
@@ -536,6 +619,7 @@ impl Render for TasksView {
                     .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("All tasks"))
                     .child(div().text_xs().text_color(t.muted_foreground).child(count.to_string()))
                     .child(div().flex_1())
+                    .children(self.build_folder.map(|bytes| self.build_folder_menu(bytes, cx)))
                     .child(layout_toggle)
                     .children(run_plan)
                     .child(

@@ -632,6 +632,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleans_the_shared_build_folder_only_while_no_agent_of_the_project_works() {
+        let mut h = real_git();
+        let repo = h.dir.path().join("app");
+        init_repo(&repo);
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "").unwrap();
+        std::fs::create_dir_all(repo.join("target/debug")).unwrap();
+        std::fs::write(repo.join("target/debug/out"), "x").unwrap();
+        let b = board(&mut h, &repo);
+        let id = create(&mut h, &b, "Build it", "", &b.todo);
+        h.settle().await;
+        let thread = thread_of(&h, &id);
+        async fn clean(h: &mut Harness, project: &str) -> Result<(), String> {
+            let cleaning = tokio::spawn(h.core.me.clean_build(project.to_owned()));
+            h.settle().await;
+            cleaning.await.unwrap()
+        }
+        let refused = Err("APP-1's agent is working; clean once it stops".to_owned());
+        assert_eq!(clean(&mut h, &b.project).await, refused);
+        turn_end(&mut h, &thread, "end_turn");
+        assert!(matches!(run(&h, &id), Some(TaskRun::Finished(_))));
+        h.core.dispatch(ThreadEvent { thread_id: thread.clone(), body: ThreadEventBody::Status(ThreadStatus::Running { started_at: 1 }) });
+        assert_eq!(clean(&mut h, &b.project).await, refused, "a finished task's thread the user prompted builds too");
+        assert!(repo.join("target/debug/out").exists());
+        h.core.dispatch(ThreadEvent { thread_id: thread, body: ThreadEventBody::Status(ThreadStatus::Idle) });
+        assert_eq!(clean(&mut h, &b.project).await, Ok(()));
+        assert!(!repo.join("target").exists());
+    }
+
+    #[tokio::test]
     async fn fails_when_the_agent_did_not_open_a_pull_request() {
         let mut h = real_git();
         let repo = h.dir.path().join("app");

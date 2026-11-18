@@ -92,6 +92,21 @@ pub fn short_date(at_ms: i64) -> String {
     format!("{} {day}", MONTHS[(month - 1) as usize])
 }
 
+/// "4.2 GB", in the decimal units Finder uses.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1000.;
+    let mut unit = 0;
+    while value >= 999.95 && unit < UNITS.len() - 1 {
+        value /= 1000.;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 pub fn account_label(account: &AccountStatus) -> &'static str {
     match account {
         AccountStatus::Unknown => "Not checked",
@@ -245,5 +260,10 @@ mod tests {
         assert_eq!(shorten_home("/Users/ab", "/Users/a"), "/Users/ab");
         assert_eq!(short_date(1_793_791_240_865), "Nov 4");
         assert_eq!(short_date(0), "Jan 1");
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1_000), "1.0 KB");
+        assert_eq!(format_bytes(4_230_000_000), "4.2 GB");
+        assert_eq!(format_bytes(999_960), "1.0 MB");
     }
 }

@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::build::{target_dir, target_size};
 use crate::db::Db;
 use crate::model::reducer::{Outcome, ThreadMap, reduce_threads};
 use crate::model::{
@@ -321,6 +322,28 @@ impl CoreHandle {
         })
     }
 
+    /// The bytes in the project's shared Cargo build folder, walked off the core thread; None when the
+    /// project is not a Cargo project.
+    pub fn build_folder_size(&self, project: String) -> impl Future<Output = Result<Option<u64>, String>> + use<> {
+        let walk = self.runtime.spawn_blocking(move || target_size(&project));
+        async move { walk.await.map_err(|e| e.to_string()) }
+    }
+
+    /// Runs `cargo clean` in the project, unless an agent of one of its tasks may be building.
+    pub fn clean_build(&self, project: String) -> impl Future<Output = Result<(), String>> + use<> {
+        let check = project.clone();
+        let allowed = self.command("tasks:cleanBuild", move |core| match core.tasks.state().clean_build_blocker(&check, &core.threads) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        });
+        let me = self.clone();
+        async move {
+            allowed.await?;
+            let cargo = system_cli("cargo");
+            me.on_runtime(cargo(project, vec!["clean".into()])).await.ok_or(STOPPED.to_owned())?.map(|_| ())
+        }
+    }
+
     pub fn recent_folders(&self) -> impl Future<Output = Result<Vec<String>, String>> + use<> {
         self.command("folders:recent", |core| Ok(core.recent_folders()))
     }
@@ -588,8 +611,7 @@ impl Core {
             let subscription = self.subscriptions.get(&thread.subscription_id).ok_or("This thread’s subscription was removed")?;
             let mut env = self.subscriptions.specs().get(&subscription.agent_id).map(|spec| spec.env_for(&subscription.config_dir)).unwrap_or_default();
             if let Some(task) = self.tasks.state().task_for_thread(id) {
-                let target = std::path::Path::new(&task.project).join("target");
-                env.insert("CARGO_TARGET_DIR".into(), Some(target.to_string_lossy().into_owned()));
+                env.insert("CARGO_TARGET_DIR".into(), Some(target_dir(&task.project).to_string_lossy().into_owned()));
             }
             let me = self.me.clone();
             let thread_id = id.to_owned();

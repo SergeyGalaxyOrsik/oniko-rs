@@ -2,6 +2,7 @@
 //! tasks with their git worktrees, and telemetry. The UI talks to it only through [`core::CoreHandle`]
 //! and the [`model::AppEvent`] stream, the way the Electron renderer talked to main over IPC.
 
+pub mod build;
 pub mod core;
 pub mod db;
 pub mod model;
