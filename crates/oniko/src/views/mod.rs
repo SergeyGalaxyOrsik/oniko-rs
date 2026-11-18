@@ -9,11 +9,13 @@ pub mod task_page;
 pub mod tasks;
 pub mod thread;
 
-use gpui::{App, Hsla, IntoElement, div, prelude::*, px};
-use oniko_core::model::{AccountStatus, StatusKind, TaskId, TaskStatus, TaskStatusId, ThreadId};
+use gpui::{AnyElement, App, Hsla, IntoElement, SharedString, div, prelude::*, px};
+use oniko_core::model::{AccountStatus, PrState, PullRequest, StatusKind, Task, TaskId, TaskRun, TaskStatus, TaskStatusId, TasksState, ThreadId};
 
 use crate::icons::{Icon, icon};
+use crate::state::run;
 use crate::theme::{Theme, theme};
+use crate::ui::{ButtonSize, button};
 
 /// What a screen asks the workspace to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +113,80 @@ pub fn account_color(account: &AccountStatus, t: &Theme) -> Hsla {
 }
 
 pub const LOCKED_HINT: &str = "Threads stay on the subscription they started with";
+
+/// Where a task is in the plan, as its cards and rows show it in one line.
+pub enum Progress {
+    Waiting(String),
+    Stage(&'static str),
+    Failed,
+    Review(PullRequest),
+    Merged(PullRequest),
+}
+
+impl Progress {
+    /// None for a task that is not queued behind anything and has not started.
+    pub fn of(task: &Task, tasks: &TasksState) -> Option<Progress> {
+        Some(match &task.run {
+            None => Progress::Waiting(tasks.waiting_reason(task)?),
+            Some(TaskRun::Starting) => Progress::Stage("Starting"),
+            Some(TaskRun::Working(_)) => Progress::Stage("Agent working"),
+            Some(TaskRun::PullRequest(_)) => Progress::Stage("Opening a pull request"),
+            Some(TaskRun::Finished(_)) => Progress::Stage("Finished"),
+            Some(TaskRun::Failed { .. }) => Progress::Failed,
+            Some(TaskRun::Review(review)) => Progress::Review(review.pr.clone()),
+            Some(TaskRun::Merged(merged)) => Progress::Merged(merged.pr.clone()),
+        })
+    }
+
+    /// One muted line; a pull request links to GitHub, and one under review can be checked now.
+    pub fn render(self, id: &str, cx: &App) -> AnyElement {
+        let t = theme(cx);
+        let line = div().flex().flex_wrap().items_center().gap_x_1p5().min_w_0().text_xs().text_color(t.muted_foreground);
+        match self {
+            Progress::Waiting(reason) => line.child(div().truncate().child(reason)).into_any_element(),
+            Progress::Stage(stage) => line.child(div().truncate().child(stage)).into_any_element(),
+            Progress::Failed => line.text_color(t.destructive).child("Failed").into_any_element(),
+            Progress::Review(pr) => {
+                let label = match pr.state {
+                    PrState::Closed => format!("PR #{} closed", pr.number),
+                    _ => format!("PR #{} in review", pr.number),
+                };
+                line.child(pr_link(id, &pr, label, cx))
+                    .when(pr.state == PrState::Open, |d| {
+                        d.child(
+                            button(SharedString::from(format!("{id}-check-pr")), "Check now")
+                                .size(ButtonSize::Xs)
+                                .muted()
+                                .tooltip("Ask GitHub whether the pull request was merged")
+                                .on_click(|_, _, cx| run(cx, |c| c.check_pull_requests())),
+                        )
+                    })
+                    .into_any_element()
+            }
+            Progress::Merged(pr) => line.child(pr_link(id, &pr, format!("PR #{} merged", pr.number), cx)).into_any_element(),
+        }
+    }
+}
+
+fn pr_link(id: &str, pr: &PullRequest, label: String, cx: &App) -> AnyElement {
+    let t = theme(cx);
+    let url = pr.url.clone();
+    div()
+        .id(SharedString::from(format!("{id}-pr-link")))
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .cursor_pointer()
+        .hover(|s| s.text_color(t.foreground).underline())
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            cx.open_url(&url);
+        })
+        .child(icon(Icon::GitPullRequest, t.muted_foreground).size(px(12.)))
+        .child(label)
+        .into_any_element()
+}
 
 /// Linear's workflow icons: a dashed ring for backlog, an empty ring before work starts, a ring with a
 /// dot as work moves along, a filled check when done and a filled cross when canceled.

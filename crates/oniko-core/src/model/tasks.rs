@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use super::subscriptions::SubscriptionId;
@@ -422,6 +424,39 @@ impl TasksState {
     pub fn dependents(&self, id: &str) -> Vec<&Task> {
         self.tasks.iter().filter(|t| t.blocked_by.iter().any(|b| b == id)).collect()
     }
+
+    /// The plan's columns: a task with no blockers is in wave 0, any other one wave after its latest
+    /// blocker. Canceled tasks are left out, and so are links to them. Each wave keeps the list order.
+    pub fn plan_waves(&self, project: &str) -> Vec<Vec<&Task>> {
+        let tasks: Vec<&Task> = self.project_tasks(project).into_iter().filter(|t| self.kind(t) != Some(StatusKind::Canceled)).collect();
+        let mut waves: HashMap<&str, usize> = HashMap::new();
+        fn wave<'a>(id: &'a str, tasks: &[&'a Task], waves: &mut HashMap<&'a str, usize>) -> usize {
+            if let Some(w) = waves.get(id) {
+                return *w;
+            }
+            // Placeholder so a cycle the store should have rejected ends instead of recursing forever.
+            waves.insert(id, 0);
+            let task = tasks.iter().find(|t| t.id == id).expect("only planned tasks are visited");
+            let w = task
+                .blocked_by
+                .iter()
+                .filter(|b| tasks.iter().any(|t| t.id == **b))
+                .map(|b| wave(b, tasks, waves) + 1)
+                .max()
+                .unwrap_or(0);
+            waves.insert(id, w);
+            w
+        }
+        let mut columns: Vec<Vec<&Task>> = Vec::new();
+        for task in &tasks {
+            let w = wave(&task.id, &tasks, &mut waves);
+            if columns.len() <= w {
+                columns.resize_with(w + 1, Vec::new);
+            }
+            columns[w].push(task);
+        }
+        columns
+    }
 }
 
 /// `ONI` for a folder named `oniko`: the first three letters or digits of the folder name.
@@ -620,5 +655,24 @@ mod tests {
         assert!(plan.state.depends_on("3", "1"));
         assert!(!plan.state.depends_on("1", "3"));
         assert_eq!(plan.state.dependents("1").iter().map(|t| t.number).collect::<Vec<_>>(), [2]);
+    }
+
+    fn waves(plan: &Plan) -> Vec<Vec<i64>> {
+        plan.state.plan_waves("/p/oniko").iter().map(|w| w.iter().map(|t| t.number).collect()).collect()
+    }
+
+    #[test]
+    fn plans_in_waves_after_the_latest_blocker() {
+        let plan = Plan::new().task(21, "s", &[]).task(22, "s", &[]).task(23, "u", &[21]).task(24, "u", &[21]).task(25, "u", &[23, 24]);
+        assert_eq!(waves(&plan), [vec![21, 22], vec![23, 24], vec![25]]);
+        let uneven = Plan::new().task(1, "u", &[]).task(2, "u", &[1]).task(3, "u", &[1, 2]).task(4, "b", &[]);
+        assert_eq!(waves(&uneven), [vec![4, 1], vec![2], vec![3]], "a wave keeps the list order: Backlog before To do");
+    }
+
+    #[test]
+    fn leaves_canceled_tasks_out_of_the_plan() {
+        let plan = Plan::new().task(1, "x", &[]).task(2, "u", &[1]).task(3, "u", &[2]);
+        assert_eq!(waves(&plan), [vec![2], vec![3]]);
+        assert!(waves(&Plan::new()).is_empty());
     }
 }
