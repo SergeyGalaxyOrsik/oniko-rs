@@ -13,7 +13,7 @@ use crate::theme::theme;
 use crate::ui::text_field::{TextField, TextFieldEvent};
 use crate::ui::{ButtonSize, MenuEntry, button, dropdown, field_frame, icon_button, item};
 use crate::views::task_page::TaskPage;
-use crate::views::{Nav, short_date, status_icon};
+use crate::views::{Nav, Progress, short_date, status_icon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Layout {
@@ -285,6 +285,7 @@ impl TasksView {
                                 d.child(div().truncate().text_sm().text_color(t.muted_foreground).child(task.description.lines().next().unwrap_or("").to_owned()))
                             }),
                     )
+                    .children(Progress::of(task, &state).map(|p| div().flex_none().max_w(px(320.)).child(p.render(&format!("row-{}", task.id), cx))))
                     .child(div().flex_none().text_xs().text_color(t.muted_foreground).child(short_date(task.created_at)))
             }).collect::<Vec<_>>();
             let count = tasks.len();
@@ -364,6 +365,7 @@ impl TasksView {
                     .child(div().text_xs().text_color(t.muted_foreground).child(task.key()))
                     .child(div().flex().items_start().gap_2().child(self.task_status_picker(task, status, statuses, cx)).child(div().flex_1().min_w_0().text_sm().child(task.title.clone())))
                     .when(!task.description.is_empty(), |d| d.child(div().text_xs().text_color(t.muted_foreground).line_clamp(2).child(task.description.clone())))
+                    .children(Progress::of(task, &state).map(|p| p.render(&format!("card-{}", task.id), cx)))
                     .child(div().text_xs().text_color(t.muted_foreground).child(short_date(task.created_at)))
             }).collect::<Vec<_>>();
             div()
